@@ -39,6 +39,38 @@ jobs = queue.Queue()  # аудио -> единственный ML-поток (ML
 stream_holder = {}  # текущий InputStream; пересоздаётся при смене устройства/тишине
 
 
+import ctypes
+
+_coreaudio = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+
+
+class _PropAddr(ctypes.Structure):
+    _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32),
+                ("element", ctypes.c_uint32)]
+
+
+_LISTENER_T = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_uint32, ctypes.c_uint32,
+                               ctypes.POINTER(_PropAddr), ctypes.c_void_p)
+_listener_refs = []  # защита колбэка и адреса от сборщика мусора
+
+
+def _fourcc(s: str) -> int:
+    return int.from_bytes(s.encode(), "big")
+
+
+def watch_default_input(on_change):
+    """CoreAudio-событие «вход по умолчанию сменился» (надели AirPods и т.п.)."""
+    addr = _PropAddr(_fourcc("dIn "), _fourcc("glob"), 0)
+
+    def _cb(obj, n, a, ctx):
+        on_change()
+        return 0
+
+    cb = _LISTENER_T(_cb)
+    _listener_refs.extend([cb, addr])
+    _coreaudio.AudioObjectAddPropertyListener(1, ctypes.byref(addr), cb, None)
+
+
 def probe_rms(device) -> float:
     try:
         a = sd.rec(int(0.3 * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1,
@@ -67,7 +99,7 @@ def pick_device():
     return default_idx, default["name"], True  # все молчат — остаёмся на дефолте
 
 
-def reopen_stream():
+def reopen_stream(follow_default=False):
     """Полный перезапуск аудио: закрыть поток, перечитать устройства CoreAudio, открыть заново."""
     old = stream_holder.pop("stream", None)
     if old:
@@ -79,7 +111,7 @@ def reopen_stream():
         sd._terminate(); sd._initialize()
     except Exception:
         pass
-    open_stream()
+    open_stream(follow_default=follow_default)
 
 
 def ensure_stream():
@@ -98,12 +130,17 @@ def ensure_stream():
             print(f"  не удалось открыть микрофон: {e}", flush=True)
 
 
-def open_stream():
+def open_stream(follow_default=False):
     old = stream_holder.pop("stream", None)
     if old:
         old.stop()
         old.close()
-    dev, name, is_default = pick_device()
+    if follow_default:
+        # смена входа по умолчанию — это действие пользователя, верим без проб
+        d = sd.query_devices(kind="input")
+        dev, name, is_default = d["index"], d["name"], True
+    else:
+        dev, name, is_default = pick_device()
     s = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                        device=dev, callback=audio_callback)
     s.start()
@@ -111,6 +148,24 @@ def open_stream():
     note = "" if is_default else "  (вход по умолчанию молчит — взял живой)"
     STATE["mic"] = name
     print(f"Микрофон: {name}{note}", flush=True)
+
+
+mic_changed = threading.Event()
+
+
+def mic_watcher():
+    """Ловит смену входа по умолчанию и пересаживает поток на новое устройство."""
+    while True:
+        mic_changed.wait()
+        time.sleep(0.7)  # дебаунс: при переключении CoreAudio сыплет пачку событий
+        mic_changed.clear()
+        while recording:  # не дёргать поток посреди записи
+            time.sleep(0.2)
+        try:
+            print("Сменился вход по умолчанию — переключаюсь...", flush=True)
+            reopen_stream(follow_default=True)
+        except Exception as e:
+            print(f"  не удалось переключить микрофон: {e}", flush=True)
 
 
 def load_terms() -> str:
@@ -406,6 +461,8 @@ def main():
     ready = threading.Event()
     threading.Thread(target=ml_worker, args=(ready,), daemon=True).start()
     threading.Thread(target=open_stream, daemon=True).start()
+    threading.Thread(target=mic_watcher, daemon=True).start()
+    watch_default_input(mic_changed.set)
     keyboard.Listener(on_press=on_press, on_release=on_release).start()
     print("Меню-бар запущен. Зажми правый Option и говори; отпусти — текст вставится.")
     DictateApp().run()
