@@ -375,7 +375,33 @@ class DictateApp(rumps.App):
         subprocess.run(["open", "-t", os.path.join(BASE, "dictate.log")])
 
 
+def request_permissions():
+    """При старте: проверить все три TCC-разрешения и запросить недостающие системными диалогами."""
+    import ctypes
+    from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
+    from AVFoundation import AVCaptureDevice
+    missing = []
+    # Микрофон: 3 = granted; запрос покажет системный диалог
+    if AVCaptureDevice.authorizationStatusForMediaType_("soun") != 3:
+        AVCaptureDevice.requestAccessForMediaType_completionHandler_("soun", lambda ok: None)
+        missing.append("Микрофон")
+    # Мониторинг ввода: 0 = granted; запрос добавит python3 в список и покажет диалог
+    iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+    if iokit.IOHIDCheckAccess(1) != 0:
+        iokit.IOHIDRequestAccess(1)
+        missing.append("Мониторинг ввода")
+    # Универсальный доступ: диалог со ссылкой в настройки
+    if not AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}):
+        missing.append("Универсальный доступ")
+    if missing:
+        print(f"⚠ Нет разрешений: {', '.join(missing)}. Выдай в Настройках → "
+              f"Конфиденциальность и перезапусти (daemon.sh restart).", flush=True)
+    else:
+        print("Разрешения: все выданы.", flush=True)
+
+
 def main():
+    request_permissions()
     print(f"Прогреваю модели ({ASR_MODEL.split('/')[-1]} + {LLM_MODEL.split('/')[-1]})...")
     ready = threading.Event()
     threading.Thread(target=ml_worker, args=(ready,), daemon=True).start()
