@@ -13,6 +13,7 @@ import threading
 import time
 
 import numpy as np
+import rumps
 import sounddevice as sd
 import mlx_whisper
 from mlx_whisper.transcribe import ModelHolder
@@ -24,11 +25,12 @@ from AppKit import NSWorkspace
 BASE = os.path.dirname(os.path.abspath(__file__))
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
-ENHANCE = True  # False — вставлять сырой текст Whisper без LLM-чистки
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
 HOTKEY = keyboard.Key.alt_r  # правый Option
 SAMPLE_RATE = 16000
 MIN_DURATION = 0.4  # сек; короче — случайное нажатие, игнорируем
+
+STATE = {"loading": True, "mic": "…", "enhance": True}
 
 recording = False
 chunks = []
@@ -107,6 +109,7 @@ def open_stream():
     s.start()
     stream_holder["stream"] = s
     note = "" if is_default else "  (вход по умолчанию молчит — взял живой)"
+    STATE["mic"] = name
     print(f"Микрофон: {name}{note}", flush=True)
 
 
@@ -185,14 +188,13 @@ def strip_short_period(text: str) -> str:
 
 def ml_worker(ready: threading.Event):
     ModelHolder.get_model(ASR_MODEL, mx.float16)
-    llm = tok = None
-    if ENHANCE:
-        from mlx_lm import load, generate
-        llm, tok = load(LLM_MODEL)
-        generate(llm, tok, prompt=tok.apply_chat_template(
-            [{"role": "user", "content": "ок"}], add_generation_prompt=True),
-            max_tokens=4, verbose=False)  # прогрев, чтобы первая диктовка была быстрой
+    from mlx_lm import load, generate
+    llm, tok = load(LLM_MODEL)
+    generate(llm, tok, prompt=tok.apply_chat_template(
+        [{"role": "user", "content": "ок"}], add_generation_prompt=True),
+        max_tokens=4, verbose=False)  # прогрев, чтобы первая диктовка была быстрой
     db = history_db()
+    STATE["loading"] = False
     ready.set()
 
     def enhance(raw: str) -> str:
@@ -237,7 +239,7 @@ def ml_worker(ready: threading.Event):
             continue
         text = raw
         t_llm = 0.0
-        if ENHANCE and needs_enhance(raw):
+        if STATE["enhance"] and needs_enhance(raw):
             t1 = time.time()
             try:
                 text = enhance(raw)
@@ -278,16 +280,65 @@ def on_release(key):
             jobs.put(audio)
 
 
+class DictateApp(rumps.App):
+    def __init__(self):
+        super().__init__("Dictate", title="⏳", quit_button=rumps.MenuItem("Выход"))
+        self.mic_item = rumps.MenuItem("Микрофон: …")
+        self.recent = rumps.MenuItem("Последние (клик — скопировать)")
+        self.recent.add(rumps.MenuItem("пусто"))
+        self.enh_item = rumps.MenuItem("LLM-чистка паразитов", callback=self.toggle_enhance)
+        self.enh_item.state = int(STATE["enhance"])
+        self.menu = [self.mic_item, self.recent, None,
+                     self.enh_item,
+                     rumps.MenuItem("Словарь терминов…", callback=self.open_terms),
+                     rumps.MenuItem("Лог…", callback=self.open_log), None]
+        rumps.Timer(self.refresh_title, 0.3).start()
+        rumps.Timer(self.refresh_recent, 3.0).start()
+
+    def refresh_title(self, _):
+        self.title = "⏳" if STATE["loading"] else ("🔴" if recording else "🎤")
+        self.mic_item.title = f"Микрофон: {STATE['mic']}"
+
+    def refresh_recent(self, _):
+        try:
+            db = sqlite3.connect(os.path.join(BASE, "history.sqlite3"))
+            rows = db.execute("SELECT text FROM transcriptions "
+                              "ORDER BY id DESC LIMIT 5").fetchall()
+            db.close()
+        except Exception:
+            return
+        self.recent.clear()
+        if not rows:
+            self.recent.add(rumps.MenuItem("пусто"))
+            return
+        for (text,) in rows:
+            label = text if len(text) <= 60 else text[:57] + "…"
+            item = rumps.MenuItem(label, callback=self.copy_item)
+            item._full_text = text
+            self.recent.add(item)
+
+    def copy_item(self, sender):
+        subprocess.run(["pbcopy"], input=sender._full_text.encode())
+
+    def toggle_enhance(self, sender):
+        STATE["enhance"] = not STATE["enhance"]
+        sender.state = int(STATE["enhance"])
+
+    def open_terms(self, _):
+        subprocess.run(["open", "-t", os.path.join(BASE, "terms.txt")])
+
+    def open_log(self, _):
+        subprocess.run(["open", "-t", os.path.join(BASE, "dictate.log")])
+
+
 def main():
-    print(f"Прогреваю модели ({ASR_MODEL.split('/')[-1]}"
-          f"{' + ' + LLM_MODEL.split('/')[-1] if ENHANCE else ''})...")
+    print(f"Прогреваю модели ({ASR_MODEL.split('/')[-1]} + {LLM_MODEL.split('/')[-1]})...")
     ready = threading.Event()
     threading.Thread(target=ml_worker, args=(ready,), daemon=True).start()
-    ready.wait()
-    open_stream()
-    print("Готово. Зажми правый Option и говори; отпусти — текст вставится. Ctrl+C — выход.")
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-        listener.join()
+    threading.Thread(target=open_stream, daemon=True).start()
+    keyboard.Listener(on_press=on_press, on_release=on_release).start()
+    print("Меню-бар запущен. Зажми правый Option и говори; отпусти — текст вставится.")
+    DictateApp().run()
 
 
 if __name__ == "__main__":
