@@ -1,0 +1,19 @@
+[project]
+name = "dictate"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gigaam",
+    "mlx-lm>=0.31.3",
+    "mlx-whisper>=0.4.3",
+    "pynput>=1.8.2",
+    "pyobjc-framework-quartz>=12.2.1",
+    "sounddevice>=0.5.5",
+    "soundfile>=0.14.0",
+    "torchaudio>=2.11.0",
+]
+
+[tool.uv.sources]
+gigaam = { git = "https://github.com/salute-developers/GigaAM" }

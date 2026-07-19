@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# данные и рантайм — не для git
+history.sqlite3
+*.wav
+*.aiff
+*.log
+
+# личный словарь терминов (в репо — terms.example.txt)
+terms.txt
