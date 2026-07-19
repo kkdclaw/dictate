@@ -1,5 +1,17 @@
 # dictate
 
+**EN:** Local push-to-talk dictation for macOS (Apple Silicon), fully offline.
+Hold right Option, speak, release — text is typed into whatever app has focus.
+Pipeline: Silero VAD → Whisper large-v3-turbo on MLX (with a user dictionary
+fed via `initial_prompt` — the main quality lever for jargon) → optional
+filler-word cleanup by a local Qwen3-4B (runs only when needed) → paste via
+synthetic ⌘V → SQLite history. Ships as a menu bar app with a launchd daemon
+(auto-start, self-healing microphone selection, permission bootstrap).
+Docs below are in Russian; the code and `daemon.sh` are self-explanatory.
+Install: `uv sync && ./daemon.sh install`. License: MIT.
+
+---
+
 Локальная push-to-talk диктовка для macOS (Apple Silicon). Зажал правый Option —
 говоришь — отпустил — текст вставился в активное поле любого приложения.
 Полностью офлайн: аудио и текст не покидают машину.
