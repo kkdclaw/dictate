@@ -398,6 +398,7 @@ class DictateApp(rumps.App):
         self.menu = [self.mic_item, self.recent, None,
                      self.enh_item,
                      rumps.MenuItem("Словарь терминов…", callback=self.open_terms),
+                     rumps.MenuItem("Предложить термины из истории", callback=self.suggest),
                      rumps.MenuItem("Лог…", callback=self.open_log), None]
         rumps.Timer(self.refresh_title, 0.3).start()
         rumps.Timer(self.refresh_recent, 3.0).start()
@@ -433,6 +434,19 @@ class DictateApp(rumps.App):
 
     def open_terms(self, _):
         subprocess.run(["open", "-t", os.path.join(BASE, "terms.txt")])
+
+    def suggest(self, _):
+        import suggest_terms
+        cands = suggest_terms.suggestions(min_count=2)
+        if not cands:
+            rumps.alert("Словарь", "Кандидатов пока нет: нет исправлений, "
+                        "повторившихся хотя бы дважды. Диктуй дальше.")
+            return
+        listing = "\n".join(f"{src} → {dst}  ({n} раз)" for dst, src, n in cands)
+        if rumps.alert("Кандидаты в словарь", listing + "\n\nДобавить все?",
+                       ok="Добавить все", cancel="Отмена") == 1:
+            with open(os.path.join(BASE, "terms.txt"), "a") as f:
+                f.write("\n".join(dst for dst, _, _ in cands) + "\n")
 
     def open_log(self, _):
         subprocess.run(["open", "-t", os.path.join(BASE, "dictate.log")])
