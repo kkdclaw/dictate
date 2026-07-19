@@ -187,6 +187,9 @@ def strip_short_period(text: str) -> str:
 
 
 def ml_worker(ready: threading.Event):
+    import torch
+    from silero_vad import load_silero_vad, get_speech_timestamps
+    vad = load_silero_vad(onnx=True)
     ModelHolder.get_model(ASR_MODEL, mx.float16)
     from mlx_lm import load, generate
     llm, tok = load(LLM_MODEL)
@@ -220,6 +223,13 @@ def ml_worker(ready: threading.Event):
             except Exception as e:
                 print(f"  не удалось переоткрыть: {e}", flush=True)
             continue
+        # VAD: есть ли вообще речь, и если есть — обрезать тишину по краям
+        spans = get_speech_timestamps(torch.from_numpy(audio), vad, sampling_rate=SAMPLE_RATE)
+        if not spans:
+            print("  ✗ речи не слышно — не вставляю", flush=True)
+            continue
+        audio = audio[max(0, spans[0]["start"] - SAMPLE_RATE // 10):
+                      spans[-1]["end"] + SAMPLE_RATE // 10]
         t0 = time.time()
         try:
             raw = mlx_whisper.transcribe(
@@ -257,27 +267,61 @@ def ml_worker(ready: threading.Event):
               f"{text}{mark}", flush=True)
 
 
+TAP_MAX = 0.35  # сек: короче — «тап» (toggle-режим), дольше — классический push-to-talk
+
+toggle_mode = False
+press_time = 0.0
+
+
+def stop_and_submit():
+    global recording, toggle_mode
+    recording = False
+    toggle_mode = False
+    with lock:
+        if not chunks:
+            return
+        audio = np.concatenate(chunks).flatten().astype(np.float32)
+        chunks.clear()
+    if len(audio) / SAMPLE_RATE >= MIN_DURATION:
+        jobs.put(audio)
+
+
+def cancel_recording():
+    global recording, toggle_mode
+    recording = False
+    toggle_mode = False
+    with lock:
+        chunks.clear()
+    print("  ✗ запись отменена (Esc)", flush=True)
+
+
 def on_press(key):
-    global recording
-    if key == HOTKEY and not recording:
+    global recording, press_time
+    if key == keyboard.Key.esc and recording:
+        cancel_recording()
+        return
+    if key != HOTKEY:
+        return
+    if not recording:
         ensure_stream()
         with lock:
             chunks.clear()
+        press_time = time.time()
         recording = True
         print("● запись...", flush=True)
+    elif toggle_mode:
+        stop_and_submit()  # второй тап — стоп
 
 
 def on_release(key):
-    global recording
-    if key == HOTKEY and recording:
-        recording = False
-        with lock:
-            if not chunks:
-                return
-            audio = np.concatenate(chunks).flatten().astype(np.float32)
-            chunks.clear()
-        if len(audio) / SAMPLE_RATE >= MIN_DURATION:
-            jobs.put(audio)
+    global toggle_mode
+    if key != HOTKEY or not recording:
+        return
+    if time.time() - press_time < TAP_MAX:
+        toggle_mode = True  # короткий тап: пишем дальше до второго тапа или Esc
+        print("  … toggle-режим: говори, ещё один тап Option — стоп, Esc — отмена", flush=True)
+    else:
+        stop_and_submit()  # классика: отпустил — обрабатываем
 
 
 class DictateApp(rumps.App):
