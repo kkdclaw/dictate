@@ -65,6 +65,37 @@ def pick_device():
     return default_idx, default["name"], True  # все молчат — остаёмся на дефолте
 
 
+def reopen_stream():
+    """Полный перезапуск аудио: закрыть поток, перечитать устройства CoreAudio, открыть заново."""
+    old = stream_holder.pop("stream", None)
+    if old:
+        try:
+            old.stop(); old.close()
+        except Exception:
+            pass
+    try:
+        sd._terminate(); sd._initialize()
+    except Exception:
+        pass
+    open_stream()
+
+
+def ensure_stream():
+    """Перед записью: если поток умер или пульс пропал (микрофон отвалился) — переоткрыть."""
+    s = stream_holder.get("stream")
+    alive = False
+    try:
+        alive = bool(s) and s.active and time.time() - stream_holder.get("last_cb", 0) < 2.0
+    except Exception:
+        pass
+    if not alive:
+        print("  микрофон пропал — переоткрываю...", flush=True)
+        try:
+            reopen_stream()
+        except Exception as e:
+            print(f"  не удалось открыть микрофон: {e}", flush=True)
+
+
 def open_stream():
     old = stream_holder.pop("stream", None)
     if old:
@@ -129,6 +160,7 @@ def history_db() -> sqlite3.Connection:
 
 
 def audio_callback(indata, frames, t, status):
+    stream_holder["last_cb"] = time.time()  # пульс: колбэки идут, пока устройство живо
     with lock:
         if recording:
             chunks.append(indata.copy())
@@ -182,11 +214,7 @@ def ml_worker(ready: threading.Event):
             print("  ✗ запись тихая (AirPods в кейсе? крышка закрыта?) — "
                   "ищу живой микрофон, попробуй ещё раз", flush=True)
             try:
-                old = stream_holder.pop("stream", None)
-                if old:
-                    old.stop(); old.close()
-                sd._terminate(); sd._initialize()  # перечитать список устройств CoreAudio
-                open_stream()
+                reopen_stream()
             except Exception as e:
                 print(f"  не удалось переоткрыть: {e}", flush=True)
             continue
@@ -230,6 +258,7 @@ def ml_worker(ready: threading.Event):
 def on_press(key):
     global recording
     if key == HOTKEY and not recording:
+        ensure_stream()
         with lock:
             chunks.clear()
         recording = True
