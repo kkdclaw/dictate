@@ -24,8 +24,7 @@ def rows():
     db = sqlite3.connect(os.path.join(BASE, "history.sqlite3"))
     db.row_factory = sqlite3.Row
     try:
-        r = db.execute("SELECT ts, text, raw_text, duration, app "
-                       "FROM transcriptions ORDER BY ts DESC").fetchall()
+        r = db.execute("SELECT * FROM transcriptions ORDER BY ts DESC").fetchall()
     except sqlite3.OperationalError:
         r = []
     db.close()
@@ -57,6 +56,16 @@ def compute(rs):
             by_day[d][1] += 1
         by_hour[datetime.fromtimestamp(r["ts"]).hour] += 1
     manual, auto = dict_sizes()
+
+    def col(r, name):
+        try:
+            return r[name]
+        except (IndexError, KeyError):
+            return None
+    tps = [col(r, "gen_tps") for r in rs if col(r, "gen_tps")]
+    asr_ms = [col(r, "asr_ms") for r in rs if col(r, "asr_ms")]
+    llm_ms = [col(r, "llm_ms") for r in rs if col(r, "llm_ms")]
+    avg = lambda xs: round(sum(xs) / len(xs)) if xs else 0
     return {
         "total": total, "words": words, "secs": secs, "corrected": corrected,
         "corr_rate": round(100 * corrected / total) if total else 0,
@@ -66,6 +75,8 @@ def compute(rs):
         "by_day": sorted(by_day.items()),
         "by_hour": [by_hour.get(h, 0) for h in range(24)],
         "dict_manual": manual, "dict_auto": auto,
+        "gen_tps_avg": avg(tps), "asr_ms_avg": avg(asr_ms), "llm_ms_avg": avg(llm_ms),
+        "tps_series": list(reversed(tps))[-40:],  # хронологически, последние 40
     }
 
 
@@ -155,6 +166,34 @@ def hours(by_hour):
     return "".join(svg)
 
 
+def sparkline(vals, unit=""):
+    if not vals:
+        return '<p class="empty">пока нет замеров LLM — подиктуй фразы с чисткой</p>'
+    w, h, pad = 620, 150, 26
+    mx, mn = max(vals), min(vals)
+    rng = (mx - mn) or 1
+    n = len(vals)
+    step = (w - 2*pad) / max(n - 1, 1)
+    pts = [(pad + i*step, h - pad - (h - 2*pad) * (v - mn) / rng) for i, v in enumerate(vals)]
+    d = "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    area = d + f" L{pts[-1][0]:.1f},{h-pad} L{pts[0][0]:.1f},{h-pad} Z"
+    avg = sum(vals) / n
+    ya = h - pad - (h - 2*pad) * (avg - mn) / rng
+    svg = [f'<svg viewBox="0 0 {w} {h}" class="chart">']
+    svg.append(f'<path d="{area}" fill="var(--series)" opacity="0.10"/>')
+    svg.append(f'<line x1="{pad}" y1="{ya:.1f}" x2="{w-pad}" y2="{ya:.1f}" class="grid"/>')
+    svg.append(f'<text x="{w-pad}" y="{ya-5:.1f}" text-anchor="end" class="tick">'
+               f'среднее {round(avg)}{unit}</text>')
+    svg.append(f'<path d="{d}" fill="none" stroke="var(--series)" stroke-width="2" '
+               f'stroke-linejoin="round"/>')
+    lx, ly = pts[-1]
+    svg.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="4" fill="var(--series)"/>')
+    svg.append(f'<text x="{lx:.1f}" y="{ly-9:.1f}" text-anchor="end" class="val">'
+               f'{round(vals[-1])}{unit}</text>')
+    svg.append("</svg>")
+    return "".join(svg)
+
+
 def donut(rate):
     r, c = 52, 2 * 3.14159 * 52
     off = c * (1 - rate / 100)
@@ -201,7 +240,18 @@ def build(active="stats"):
       <div class="grid2">
         <div class="card"><h3>Куда диктуешь</h3>{bars_h(apps)}</div>
         <div class="card"><h3>В какое время суток</h3>{hours(s["by_hour"])}</div>
-      </div>'''
+      </div>
+      <h2 class="sec">Производительность</h2>
+      <div class="tiles">
+        {tile("Скорость генерации LLM", s["gen_tps_avg"] or "—", "токенов/с в среднем")}
+        {tile("Распознавание", f'{s["asr_ms_avg"]} мс' if s["asr_ms_avg"] else "—", "на фразу")}
+        {tile("LLM-чистка", f'{s["llm_ms_avg"]} мс' if s["llm_ms_avg"] else "—",
+              "когда включается")}
+        {tile("Модели", "MLX", "Whisper + Qwen на GPU")}
+      </div>
+      <div class="card"><h3>Скорость генерации LLM по фразам
+        <span class="key">токенов/с, последние {len(s["tps_series"])}</span></h3>
+        {sparkline(s["tps_series"], " т/с")}</div>'''
 
     return PAGE.replace("__ACTIVE__", active) \
                .replace("__STATS__", stats_html) \
@@ -239,6 +289,7 @@ main{max-width:1320px;margin:0 auto;padding:22px 28px 60px}
 .tile-v{font-size:30px;font-weight:600;margin:6px 0 2px;letter-spacing:-.01em}
 .tile-s{color:var(--muted);font-size:12px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.sec{font-size:15px;font-weight:600;margin:22px 0 12px;color:var(--ink2)}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px}
 .card.center{display:flex;flex-direction:column;align-items:center}
 .card h3{margin:0 0 14px;font-size:14px;font-weight:600;display:flex;

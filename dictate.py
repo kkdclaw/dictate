@@ -274,6 +274,12 @@ def history_db() -> sqlite3.Connection:
         "id INTEGER PRIMARY KEY, ts REAL, text TEXT, raw_text TEXT, "
         "duration REAL, app TEXT)"
     )
+    # метрики скорости — добавляем к существующей таблице, если их ещё нет
+    have = {r[1] for r in db.execute("PRAGMA table_info(transcriptions)")}
+    for col in ("style TEXT", "asr_ms REAL", "llm_ms REAL",
+                "gen_tps REAL", "gen_tokens INTEGER"):
+        if col.split()[0] not in have:
+            db.execute(f"ALTER TABLE transcriptions ADD COLUMN {col}")
     return db
 
 
@@ -362,11 +368,14 @@ def ml_worker(ready: threading.Event):
     spk = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
                                          savedir=os.path.join(BASE, "models/ecapa"))
     ModelHolder.get_model(ASR_MODEL, mx.float16)
-    from mlx_lm import load, generate
+    from mlx_lm import load, stream_generate
     llm, tok = load(LLM_MODEL)
-    generate(llm, tok, prompt=tok.apply_chat_template(
-        [{"role": "user", "content": "ок"}], add_generation_prompt=True),
-        max_tokens=4, verbose=False)  # прогрев, чтобы первая диктовка была быстрой
+    last_stats = {}  # заполняется llm_run: gen_tps, prompt_tps, gen_tokens
+
+    for _ in stream_generate(llm, tok, prompt=tok.apply_chat_template(
+            [{"role": "user", "content": "ок"}], add_generation_prompt=True),
+            max_tokens=4):
+        pass  # прогрев, чтобы первая диктовка была быстрой
     db = history_db()
     voiceprint = np.load(VOICEPRINT_PATH) if os.path.exists(VOICEPRINT_PATH) else None
     STATE["loading"] = False
@@ -390,9 +399,14 @@ def ml_worker(ready: threading.Event):
     def llm_run(system: str, user: str, max_factor: int = 2) -> str:
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         prompt = tok.apply_chat_template(msgs, add_generation_prompt=True)
-        return generate(llm, tok, prompt=prompt,
-                        max_tokens=len(tok.encode(user)) * max_factor + 60,
-                        verbose=False).strip()
+        parts, resp = [], None
+        for resp in stream_generate(llm, tok, prompt=prompt,
+                                    max_tokens=len(tok.encode(user)) * max_factor + 60):
+            parts.append(resp.text)
+        if resp is not None:
+            last_stats.update(gen_tps=resp.generation_tps, prompt_tps=resp.prompt_tps,
+                              gen_tokens=resp.generation_tokens)
+        return "".join(parts).strip()
 
     def enhance(raw: str, formal: bool = False, doubtful=None) -> str:
         system = system_prompt() + (FORMAL_PROMPT_ADDON if formal else "")
@@ -485,6 +499,7 @@ def ml_worker(ready: threading.Event):
         style = style_for(app)
         text = raw
         t_llm = 0.0
+        last_stats.clear()  # сбрасываем перед возможным запуском LLM
         t1 = time.time()
         try:
             if style == "translate":
@@ -508,13 +523,21 @@ def ml_worker(ready: threading.Event):
         else:
             text = strip_short_period(text)
         paste_text(text)
-        db.execute("INSERT INTO transcriptions (ts, text, raw_text, duration, app) "
-                   "VALUES (?, ?, ?, ?, ?)", (time.time(), text, raw, duration, app))
+        gen_tps = last_stats.get("gen_tps")
+        gen_tokens = last_stats.get("gen_tokens")
+        db.execute(
+            "INSERT INTO transcriptions (ts, text, raw_text, duration, app, "
+            "style, asr_ms, llm_ms, gen_tps, gen_tokens) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), text, raw, duration, app, style,
+             round(t_asr * 1000), round(t_llm * 1000), gen_tps, gen_tokens))
         db.commit()
         mark = "" if text == strip_short_period(raw) else f"  (сырой: {raw})"
         doubt = f"  [сомнения: {', '.join(doubtful[:5])}]" if doubtful else ""
-        print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s + llm {t_llm:.1f}s → "
-              f"{app}/{style}] {text}{mark}{doubt}", flush=True)
+        speed = f" @{gen_tps:.0f}т/с" if gen_tps else ""
+        rtf = duration / t_asr if t_asr else 0
+        print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
+              f"llm {t_llm:.1f}s{speed} → {app}/{style}] {text}{mark}{doubt}", flush=True)
 
 
 TAP_MAX = 0.35  # сек: короче — «тап» (toggle-режим), дольше — классический push-to-talk
