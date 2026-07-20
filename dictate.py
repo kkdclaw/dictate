@@ -4,6 +4,7 @@
 Пайплайн: микрофон → whisper-large-v3-turbo (MLX) → LLM-чистка (Qwen3-4B) → вставка + история.
 Словарь терминов — terms.txt рядом со скриптом. История — history.sqlite3.
 """
+import collections
 import json
 import os
 import queue
@@ -67,6 +68,8 @@ def style_for(app: str) -> str:
 
 recording = False
 chunks = []
+PREROLL_SEC = 0.5  # секунды звука ДО нажатия, подклеиваемые к записи
+preroll = collections.deque(maxlen=64)  # кольцевой буфер последних блоков микрофона
 lock = threading.Lock()
 jobs = queue.Queue()  # аудио -> единственный ML-поток (MLX не переживает смену потока)
 stream_holder = {}  # текущий InputStream; пересоздаётся при смене устройства/тишине
@@ -261,6 +264,7 @@ def history_db() -> sqlite3.Connection:
 def audio_callback(indata, frames, t, status):
     stream_holder["last_cb"] = time.time()  # пульс: колбэки идут, пока устройство живо
     with lock:
+        preroll.append(indata.copy())
         if recording:
             chunks.append(indata.copy())
 
@@ -348,11 +352,12 @@ def ml_worker(ready: threading.Event):
                 print(f"  не удалось переоткрыть: {e}", flush=True)
             continue
         # VAD: есть ли вообще речь, и если есть — обрезать тишину по краям
-        spans = get_speech_timestamps(torch.from_numpy(audio), vad, sampling_rate=SAMPLE_RATE)
+        spans = get_speech_timestamps(torch.from_numpy(audio), vad,
+                                      sampling_rate=SAMPLE_RATE, speech_pad_ms=150)
         if not spans:
             print("  ✗ речи не слышно — не вставляю", flush=True)
             continue
-        audio = audio[max(0, spans[0]["start"] - SAMPLE_RATE // 10):
+        audio = audio[max(0, spans[0]["start"] - SAMPLE_RATE // 4):
                       spans[-1]["end"] + SAMPLE_RATE // 10]
         # отпечаток голоса: чужую речь (ТВ, коллеги) не транскрибируем
         if CONFIG["only_my_voice"] and voiceprint is not None:
@@ -447,6 +452,15 @@ def on_press(key):
         ensure_stream()
         with lock:
             chunks.clear()
+            # подклеиваем последние PREROLL_SEC до нажатия — первое слово не режется,
+            # даже если начал говорить одновременно с клавишей
+            need = int(PREROLL_SEC * SAMPLE_RATE)
+            got = 0
+            for block in reversed(preroll):
+                chunks.insert(0, block)
+                got += len(block)
+                if got >= need:
+                    break
         press_time = time.time()
         recording = True
         print("● запись...", flush=True)
