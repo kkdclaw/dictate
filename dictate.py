@@ -614,6 +614,8 @@ class DictateApp(rumps.App):
                      rumps.MenuItem("Записать отпечаток голоса (5 с)", callback=self.enroll),
                      None,
                      self.enh_item,
+                     rumps.MenuItem("Статистика…", callback=self.open_stats),
+                     rumps.MenuItem("Поиск истории…", callback=self.open_search),
                      rumps.MenuItem("Словарь терминов…", callback=self.open_terms),
                      rumps.MenuItem("Обновить автословарь из истории", callback=self.suggest),
                      rumps.MenuItem("Лог…", callback=self.open_log), None]
@@ -697,6 +699,24 @@ class DictateApp(rumps.App):
 
     def open_terms(self, _):
         subprocess.run(["open", "-t", os.path.join(BASE, "terms.txt")])
+
+    def _dashboard(self, mode):
+        def run():
+            try:
+                import importlib, dashboard
+                importlib.reload(dashboard)
+                with open(dashboard.OUT, "w") as f:
+                    f.write(dashboard.build(mode))
+                subprocess.run(["open", dashboard.OUT])
+            except Exception as e:
+                print(f"  дашборд не собрался: {e}", flush=True)
+        threading.Thread(target=run, daemon=True).start()
+
+    def open_stats(self, _):
+        self._dashboard("stats")
+
+    def open_search(self, _):
+        self._dashboard("search")
 
     def suggest(self, _):
         jobs.put(("autodict", None))
