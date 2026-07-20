@@ -23,6 +23,7 @@ import mlx.core as mx
 from pynput import keyboard
 import Quartz
 from AppKit import NSWorkspace
+import webwindow
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
@@ -701,16 +702,17 @@ class DictateApp(rumps.App):
         subprocess.run(["open", "-t", os.path.join(BASE, "terms.txt")])
 
     def _dashboard(self, mode):
-        def run():
-            try:
-                import importlib, dashboard
-                importlib.reload(dashboard)
-                with open(dashboard.OUT, "w") as f:
-                    f.write(dashboard.build(mode))
-                subprocess.run(["open", dashboard.OUT])
-            except Exception as e:
-                print(f"  дашборд не собрался: {e}", flush=True)
-        threading.Thread(target=run, daemon=True).start()
+        # сборка HTML — быстрая, делаем прямо в главном потоке (мы в колбэке меню),
+        # окно WKWebView тоже обязано создаваться на главном потоке
+        try:
+            import importlib, dashboard
+            importlib.reload(dashboard)
+            with open(dashboard.OUT, "w") as f:
+                f.write(dashboard.build(mode))
+            title = "Статистика — dictate" if mode == "stats" else "Поиск истории — dictate"
+            webwindow.show(title, dashboard.OUT)
+        except Exception as e:
+            print(f"  окно не открылось: {e}", flush=True)
 
     def open_stats(self, _):
         self._dashboard("stats")

@@ -11,6 +11,7 @@ dependencies = [
     "pynput>=1.8.2",
     "pyobjc-framework-avfoundation>=12.2.1",
     "pyobjc-framework-quartz>=12.2.1",
+    "pyobjc-framework-webkit>=12.2.1",
     "rumps>=0.4.0",
     "silero-vad>=6.2.1",
     "sounddevice>=0.5.5",
