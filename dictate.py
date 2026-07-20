@@ -239,8 +239,9 @@ def system_prompt() -> str:
         "(нужно, надо, давай, проверь) паразитами НЕ являются — сохраняй их.\n"
         "2. Исправляй ТОЛЬКО искажённые распознаванием слова. Грамматику, падежи, "
         "наклонение, порядок слов и смысл НЕ меняй. Ничего не добавляй и не пересказывай.\n"
-        f"3. Термины пользователя: {load_terms()}. Искажённое слово, созвучное термину, "
-        "исправь на термин. Правильно написанный термин НЕ заменяй на другой термин.\n"
+        f"3. Термины пользователя (только контекст): {load_terms()}. НИКОГДА не "
+        "заменяй обычное слово термином из списка и один термин другим — исправляй "
+        "словом из списка только явную ослышку, созвучную ему почти целиком.\n"
         "4. Слитные глаголы, разбитые на части, склей: «За деплой сервис» → «Задеплой сервис».\n"
         "5. Если исправлять нечего — верни текст дословно.\n"
         "Примеры: «филовер настроен» → «фейловер настроен»; «проверь зиро тир» → "
@@ -286,6 +287,48 @@ def audio_callback(indata, frames, t, status):
 FILLERS = re.compile(
     r"\b(э+м*|а+м+|мда+|ну|короче|как бы|типа|это самое|в общем|значит)\b|\b[mм]\b",
     re.IGNORECASE)
+FILLER_WORDS = {"эээ", "эм", "ну", "короче", "типа", "мда", "м", "m", "как", "бы",
+                "это", "самое", "в", "общем", "значит", "а", "э"}
+# частые слова: низкая пословная уверенность на них — не повод чинить фразу
+STOP_DOUBT = {"давай", "можно", "вообще", "просто", "очень", "когда", "если",
+              "чтобы", "нужно", "надо", "есть", "было", "этот", "который"}
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^\wёЁ-]+", " ", s).strip().lower()
+
+
+def guard_correction(raw: str, out: str, terms_lower: set) -> str:
+    """Детерминированный пост-контроль LLM: замену слова принимаем, только если
+    она созвучна исходному (обычный порог 0.55; если подставлен термин из
+    словаря — строгий 0.75). Удаления принимаем только для слов-паразитов.
+    Всё отклонённое откатывается к сырому тексту Whisper."""
+    import difflib
+    a, b = raw.split(), out.split()
+    sm = difflib.SequenceMatcher(a=[_norm(w) for w in a], b=[_norm(w) for w in b])
+    result = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            result.extend(b[j1:j2])
+        elif op == "delete":
+            src_words = [_norm(w) for w in a[i1:i2]]
+            if not all(w in FILLER_WORDS for w in src_words if w):
+                result.extend(a[i1:i2])  # удалили не паразит — вернуть
+        elif op == "insert":
+            pass  # LLM не имеет права дописывать сама по себе
+        else:  # replace
+            src, dst = _norm(" ".join(a[i1:i2])), _norm(" ".join(b[j1:j2]))
+            sim = difflib.SequenceMatcher(a=src, b=dst).ratio()
+            # подстановка термина (в любой словоформе: «роутера» ~ «роутер») —
+            # строгая планка созвучности
+            is_term = any(t and (dw.startswith(t) or t.startswith(dw))
+                          for dw in dst.split() for t in terms_lower)
+            bar = 0.75 if is_term else 0.55
+            if sim >= bar or all(w in FILLER_WORDS for w in src.split()):
+                result.extend(b[j1:j2])
+            else:
+                result.extend(a[i1:i2])  # несозвучная замена — откат
+    return " ".join(result)
 
 
 def needs_enhance(raw: str) -> bool:
@@ -331,7 +374,9 @@ def ml_worker(ready: threading.Event):
     def rebuild_autodict():
         try:
             import suggest_terms
-            added = suggest_terms.build_auto_terms(llm_run=llm_run)
+            # llm_run отключён: отбор жаргона 4B-моделью тянул обычные слова,
+            # а замусоренный словарь провоцировал подстановки при чистке
+            added = suggest_terms.build_auto_terms(llm_run=None)
             print(f"Автословарь обновлён: {', '.join(added) if added else 'пусто'}",
                   flush=True)
         except Exception as e:
@@ -353,9 +398,10 @@ def ml_worker(ready: threading.Event):
         if doubtful:
             system += ("\nДополнительно: распознаватель не уверен в словах: "
                        + ", ".join(f"«{w}»" for w in doubtful[:8])
-                       + " — это возможные ослышки (города, имена, термины, "
-                       "разорванные слова). Исправь их правдоподобно по контексту; "
-                       "если слово выглядит верным — оставь.")
+                       + " — возможны ослышки (города, имена, разорванные слова). "
+                       "Исправляй, только если ПО КОНТЕКСТУ очевидно, что было "
+                       "сказано на самом деле, и исправление созвучно исходному. "
+                       "Сомневаешься — оставь как есть. Остальные слова не трогай.")
         out = llm_run(system, raw)
         # деградация LLM (пусто / разнесло в разы) — откатываемся на сырой текст
         if not out or len(out) > len(raw) * 2 + 40:
@@ -414,9 +460,17 @@ def ml_worker(ready: threading.Event):
         except Exception as e:
             print(f"  ошибка распознавания: {e}", flush=True)
             continue
-        # слова, в которых Whisper сам не уверен, — кандидаты на ослышку
-        doubtful = [w["word"].strip() for s in result["segments"]
-                    for w in s.get("words", []) if w["probability"] < 0.6]
+        # слова, в которых Whisper сам не уверен, — кандидаты на ослышку.
+        # Первое слово, короткие и частые слова не считаем: у них низкая
+        # вероятность в норме, а «ремонт» по ним переписывает смысл
+        all_words = [w for s in result["segments"] for w in s.get("words", [])]
+        doubtful = []
+        for i, w in enumerate(all_words):
+            word = w["word"].strip()
+            core = re.sub(r"[^\wёЁ-]", "", word)
+            if (w["probability"] < 0.6 and i > 0 and len(core) >= 4
+                    and core.lower() not in STOP_DOUBT):
+                doubtful.append(word)
         t_asr = time.time() - t0
         if not raw:
             continue
@@ -440,6 +494,11 @@ def ml_worker(ready: threading.Event):
                 pass
             elif STATE["enhance"] and (needs_enhance(raw) or doubtful):  # clean / casual
                 text = enhance(raw, doubtful=doubtful)
+                terms_lower = {t.strip().lower() for t in load_terms().split(",")}
+                guarded = guard_correction(raw, text, terms_lower)
+                if guarded != text:
+                    print(f"  ⛔ пост-контроль откатил часть правок LLM", flush=True)
+                    text = guarded
         except Exception as e:
             print(f"  ошибка обработки (вставляю сырой): {e}", flush=True)
         t_llm = time.time() - t1
