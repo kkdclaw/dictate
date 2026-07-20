@@ -207,11 +207,23 @@ def mic_watcher():
 
 
 def load_terms() -> str:
-    try:
-        with open(os.path.join(BASE, "terms.txt")) as f:
-            return ", ".join(line.strip() for line in f if line.strip())
-    except FileNotFoundError:
-        return ""
+    # ручное ядро + автослой из истории; лимит ~60 слов (у initial_prompt Whisper
+    # потолок 224 токена), ручные — в приоритете
+    words, seen = [], set()
+    for fname in ("terms.txt", "auto_terms.txt"):
+        try:
+            with open(os.path.join(BASE, fname)) as f:
+                for line in f:
+                    w = line.strip()
+                    if w and not w.startswith("#") and w.lower() not in seen:
+                        words.append(w)
+                        seen.add(w.lower())
+        except FileNotFoundError:
+            pass
+        if len(words) >= 60:
+            break
+    return ", ".join(words[:60])
+
 
 
 def asr_hint() -> str:
@@ -316,6 +328,15 @@ def ml_worker(ready: threading.Event):
     STATE["loading"] = False
     ready.set()
 
+    def rebuild_autodict():
+        try:
+            import suggest_terms
+            added = suggest_terms.build_auto_terms(llm_run=llm_run)
+            print(f"Автословарь обновлён: {', '.join(added) if added else 'пусто'}",
+                  flush=True)
+        except Exception as e:
+            print(f"  автословарь не собрался: {e}", flush=True)
+
     def embed(audio: np.ndarray) -> np.ndarray:
         e = spk.encode_batch(torch.from_numpy(audio).unsqueeze(0)).squeeze().numpy()
         return e / np.linalg.norm(e)
@@ -327,16 +348,27 @@ def ml_worker(ready: threading.Event):
                         max_tokens=len(tok.encode(user)) * max_factor + 60,
                         verbose=False).strip()
 
-    def enhance(raw: str, formal: bool = False) -> str:
+    def enhance(raw: str, formal: bool = False, doubtful=None) -> str:
         system = system_prompt() + (FORMAL_PROMPT_ADDON if formal else "")
+        if doubtful:
+            system += ("\nДополнительно: распознаватель не уверен в словах: "
+                       + ", ".join(f"«{w}»" for w in doubtful[:8])
+                       + " — это возможные ослышки (города, имена, термины, "
+                       "разорванные слова). Исправь их правдоподобно по контексту; "
+                       "если слово выглядит верным — оставь.")
         out = llm_run(system, raw)
         # деградация LLM (пусто / разнесло в разы) — откатываемся на сырой текст
         if not out or len(out) > len(raw) * 2 + 40:
             return raw
         return out
 
+    rebuild_autodict()
+
     while True:
         kind, audio = jobs.get()
+        if kind == "autodict":
+            rebuild_autodict()
+            continue
         if kind == "enroll":
             nonlocal_vp = embed(audio)
             np.save(VOICEPRINT_PATH, nonlocal_vp)
@@ -375,12 +407,16 @@ def ml_worker(ready: threading.Event):
                 continue
         t0 = time.time()
         try:
-            raw = mlx_whisper.transcribe(
+            result = mlx_whisper.transcribe(
                 audio, path_or_hf_repo=ASR_MODEL, language=LANGUAGE,
-                initial_prompt=asr_hint() or None)["text"].strip()
+                initial_prompt=asr_hint() or None, word_timestamps=True)
+            raw = result["text"].strip()
         except Exception as e:
             print(f"  ошибка распознавания: {e}", flush=True)
             continue
+        # слова, в которых Whisper сам не уверен, — кандидаты на ослышку
+        doubtful = [w["word"].strip() for s in result["segments"]
+                    for w in s.get("words", []) if w["probability"] < 0.6]
         t_asr = time.time() - t0
         if not raw:
             continue
@@ -399,11 +435,11 @@ def ml_worker(ready: threading.Event):
             if style == "translate":
                 text = llm_run(TRANSLATE_PROMPT, raw, max_factor=3) or raw
             elif style == "formal":
-                text = enhance(raw, formal=True)
+                text = enhance(raw, formal=True, doubtful=doubtful)
             elif style == "raw":
                 pass
-            elif STATE["enhance"] and needs_enhance(raw):  # clean / casual
-                text = enhance(raw)
+            elif STATE["enhance"] and (needs_enhance(raw) or doubtful):  # clean / casual
+                text = enhance(raw, doubtful=doubtful)
         except Exception as e:
             print(f"  ошибка обработки (вставляю сырой): {e}", flush=True)
         t_llm = time.time() - t1
@@ -416,8 +452,9 @@ def ml_worker(ready: threading.Event):
                    "VALUES (?, ?, ?, ?, ?)", (time.time(), text, raw, duration, app))
         db.commit()
         mark = "" if text == strip_short_period(raw) else f"  (сырой: {raw})"
+        doubt = f"  [сомнения: {', '.join(doubtful[:5])}]" if doubtful else ""
         print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s + llm {t_llm:.1f}s → "
-              f"{app}/{style}] {text}{mark}", flush=True)
+              f"{app}/{style}] {text}{mark}{doubt}", flush=True)
 
 
 TAP_MAX = 0.35  # сек: короче — «тап» (toggle-режим), дольше — классический push-to-talk
@@ -519,7 +556,7 @@ class DictateApp(rumps.App):
                      None,
                      self.enh_item,
                      rumps.MenuItem("Словарь терминов…", callback=self.open_terms),
-                     rumps.MenuItem("Предложить термины из истории", callback=self.suggest),
+                     rumps.MenuItem("Обновить автословарь из истории", callback=self.suggest),
                      rumps.MenuItem("Лог…", callback=self.open_log), None]
         rumps.Timer(self.refresh_title, 0.3).start()
         rumps.Timer(self.refresh_recent, 3.0).start()
@@ -603,17 +640,10 @@ class DictateApp(rumps.App):
         subprocess.run(["open", "-t", os.path.join(BASE, "terms.txt")])
 
     def suggest(self, _):
-        import suggest_terms
-        cands = suggest_terms.suggestions(min_count=2)
-        if not cands:
-            rumps.alert("Словарь", "Кандидатов пока нет: нет исправлений, "
-                        "повторившихся хотя бы дважды. Диктуй дальше.")
-            return
-        listing = "\n".join(f"{src} → {dst}  ({n} раз)" for dst, src, n in cands)
-        if rumps.alert("Кандидаты в словарь", listing + "\n\nДобавить все?",
-                       ok="Добавить все", cancel="Отмена") == 1:
-            with open(os.path.join(BASE, "terms.txt"), "a") as f:
-                f.write("\n".join(dst for dst, _, _ in cands) + "\n")
+        jobs.put(("autodict", None))
+        rumps.alert("Автословарь", "Пересборка запущена в фоне — результат "
+                    "появится в логе строкой «Автословарь обновлён: …». "
+                    "Он также пересобирается сам при каждом старте.")
 
     def open_log(self, _):
         subprocess.run(["open", "-t", os.path.join(BASE, "dictate.log")])

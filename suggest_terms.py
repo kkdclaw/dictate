@@ -73,6 +73,57 @@ def suggestions(min_count: int) -> list:
     return out
 
 
+AUTO_PATH = os.path.join(BASE, "auto_terms.txt")
+
+
+def build_auto_terms(llm_run=None, cap=40) -> list:
+    """Собирает автослой словаря из истории. Три источника:
+    латиница в русской речи, повторившиеся исправления LLM,
+    редкие русские слова (отбирает LLM, если передан llm_run)."""
+    db = sqlite3.connect(os.path.join(BASE, "history.sqlite3"))
+    raws = [r[0] for r in db.execute("SELECT raw_text FROM transcriptions")]
+    db.close()
+    known = load_terms()
+    picked = []
+
+    def add(w):
+        if w and w.lower() not in known and w.lower() not in {p.lower() for p in picked}:
+            picked.append(w)
+
+    # 1) латинские слова в русской диктовке (Kubernetes, Redis...), >=2 раз
+    lat = Counter(w for t in raws for w in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", t))
+    for w, n in lat.most_common():
+        if n >= 2:
+            add(w)
+    # 2) устоявшиеся исправления чистки
+    for dst, _src, _n in suggestions(min_count=2):
+        add(dst)
+    # 3) редкие русские слова — отбирает LLM
+    if llm_run is not None:
+        cyr = Counter(w.lower() for t in raws
+                      for w in re.findall(r"[А-Яа-яЁё][а-яё-]{4,}", t))
+        frequent = [w for w, n in cyr.most_common(80) if n >= 3]
+        if frequent:
+            try:
+                out = llm_run(
+                    "Из списка слов выбери ТОЛЬКО узкоспециальные термины, жаргон "
+                    "и имена собственные, которых может не знать система "
+                    "распознавания речи (пример: задеплоить, фейловер). Обычные "
+                    "слова, даже айтишные (сервер, статус, кнопка, словарь), "
+                    "НЕ бери. Максимум 10. По одному на строку, без пояснений.",
+                    ", ".join(frequent))
+                for line in out.splitlines():
+                    w = line.strip(" -•,.").strip()
+                    if w.lower() in frequent:
+                        add(w)
+            except Exception:
+                pass
+    picked = picked[:cap]
+    with open(AUTO_PATH, "w") as f:
+        f.write("\n".join(picked) + ("\n" if picked else ""))
+    return picked
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--list", action="store_true", help="только показать")
