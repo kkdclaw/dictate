@@ -161,7 +161,9 @@ def ensure_stream():
     if not alive:
         print("  микрофон пропал — переоткрываю...", flush=True)
         try:
-            reopen_stream()
+            # follow_default: без проб устройств, окно потери звука минимально;
+            # если дефолт окажется мёртвым, сработает фолбэк по тихой записи
+            reopen_stream(follow_default=True)
         except Exception as e:
             print(f"  не удалось открыть микрофон: {e}", flush=True)
 
@@ -351,6 +353,11 @@ def ml_worker(ready: threading.Event):
             except Exception as e:
                 print(f"  не удалось переоткрыть: {e}", flush=True)
             continue
+        # диагностика: цифровые нули в начале = устройство ещё не отдавало звук
+        nz = np.flatnonzero(audio)
+        if len(nz) and nz[0] > SAMPLE_RATE * 0.25:
+            print(f"  ⚠ микрофон молчал первые {nz[0] / SAMPLE_RATE:.2f}с записи "
+                  f"(просыпался после переключения?)", flush=True)
         # VAD: есть ли вообще речь, и если есть — обрезать тишину по краям
         spans = get_speech_timestamps(torch.from_numpy(audio), vad,
                                       sampling_rate=SAMPLE_RATE, speech_pad_ms=150)
@@ -449,7 +456,9 @@ def on_press(key):
     if key != HOTKEY:
         return
     if not recording:
-        ensure_stream()
+        # флаг записи — сразу, проверка/оживление потока — в фоне: колбэки начнут
+        # наполнять chunks в ту же миллисекунду, как поток жив
+        threading.Thread(target=ensure_stream, daemon=True).start()
         with lock:
             chunks.clear()
             # подклеиваем последние PREROLL_SEC до нажатия — первое слово не режется,
