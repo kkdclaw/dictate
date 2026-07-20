@@ -17,3 +17,8 @@ history.sqlite3
 
 # личный словарь терминов (в репо — terms.example.txt)
 terms.txt
+
+# личный конфиг и биометрия
+config.json
+voiceprint.npy
+models/

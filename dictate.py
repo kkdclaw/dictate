@@ -4,6 +4,7 @@
 Пайплайн: микрофон → whisper-large-v3-turbo (MLX) → LLM-чистка (Qwen3-4B) → вставка + история.
 Словарь терминов — terms.txt рядом со скриптом. История — history.sqlite3.
 """
+import json
 import os
 import queue
 import re
@@ -30,7 +31,39 @@ HOTKEY = keyboard.Key.alt_r  # правый Option
 SAMPLE_RATE = 16000
 MIN_DURATION = 0.4  # сек; короче — случайное нажатие, игнорируем
 
-STATE = {"loading": True, "mic": "…", "enhance": True}
+STATE = {"loading": True, "mic": "…", "enhance": True, "app": ""}
+
+CONFIG_PATH = os.path.join(BASE, "config.json")
+VOICEPRINT_PATH = os.path.join(BASE, "voiceprint.npy")
+STYLES = {  # ключ -> подпись в меню
+    "clean": "Чистка (по умолчанию)",
+    "casual": "Разговорный (без точек)",
+    "formal": "Строгий (письменный)",
+    "raw": "Как сказано (без LLM)",
+    "translate": "Перевод → EN",
+}
+CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
+          "translate_all": False, "vp_threshold": 0.40}
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            CONFIG.update(json.load(f))
+    except (FileNotFoundError, ValueError):
+        pass
+
+
+def save_config():
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(CONFIG, f, ensure_ascii=False, indent=2)
+
+
+def style_for(app: str) -> str:
+    if CONFIG["translate_all"]:
+        return "translate"
+    return CONFIG["profiles"].get(app, CONFIG["default_style"])
+
 
 recording = False
 chunks = []
@@ -249,10 +282,23 @@ def strip_short_period(text: str) -> str:
     return text
 
 
+TRANSLATE_PROMPT = (
+    "Translate the dictated Russian text into natural, fluent English. "
+    "Keep the meaning, tone and technical terms. Output ONLY the translation."
+)
+FORMAL_PROMPT_ADDON = (
+    "\nДополнительно: оформи как аккуратный письменный текст — законченные "
+    "предложения, правильная пунктуация, без разговорных огрызков."
+)
+
+
 def ml_worker(ready: threading.Event):
     import torch
     from silero_vad import load_silero_vad, get_speech_timestamps
     vad = load_silero_vad(onnx=True)
+    from speechbrain.inference.speaker import EncoderClassifier
+    spk = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
+                                         savedir=os.path.join(BASE, "models/ecapa"))
     ModelHolder.get_model(ASR_MODEL, mx.float16)
     from mlx_lm import load, generate
     llm, tok = load(LLM_MODEL)
@@ -260,22 +306,37 @@ def ml_worker(ready: threading.Event):
         [{"role": "user", "content": "ок"}], add_generation_prompt=True),
         max_tokens=4, verbose=False)  # прогрев, чтобы первая диктовка была быстрой
     db = history_db()
+    voiceprint = np.load(VOICEPRINT_PATH) if os.path.exists(VOICEPRINT_PATH) else None
     STATE["loading"] = False
     ready.set()
 
-    def enhance(raw: str) -> str:
-        msgs = [{"role": "system", "content": system_prompt()},
-                {"role": "user", "content": raw}]
+    def embed(audio: np.ndarray) -> np.ndarray:
+        e = spk.encode_batch(torch.from_numpy(audio).unsqueeze(0)).squeeze().numpy()
+        return e / np.linalg.norm(e)
+
+    def llm_run(system: str, user: str, max_factor: int = 2) -> str:
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         prompt = tok.apply_chat_template(msgs, add_generation_prompt=True)
-        out = generate(llm, tok, prompt=prompt,
-                       max_tokens=len(tok.encode(raw)) * 2 + 50, verbose=False).strip()
+        return generate(llm, tok, prompt=prompt,
+                        max_tokens=len(tok.encode(user)) * max_factor + 60,
+                        verbose=False).strip()
+
+    def enhance(raw: str, formal: bool = False) -> str:
+        system = system_prompt() + (FORMAL_PROMPT_ADDON if formal else "")
+        out = llm_run(system, raw)
         # деградация LLM (пусто / разнесло в разы) — откатываемся на сырой текст
         if not out or len(out) > len(raw) * 2 + 40:
             return raw
         return out
 
     while True:
-        audio = jobs.get()
+        kind, audio = jobs.get()
+        if kind == "enroll":
+            nonlocal_vp = embed(audio)
+            np.save(VOICEPRINT_PATH, nonlocal_vp)
+            voiceprint = nonlocal_vp
+            print("Отпечаток голоса сохранён.", flush=True)
+            continue
         duration = len(audio) / SAMPLE_RATE
         rms = float(np.sqrt((audio ** 2).mean()))
         if rms < 1e-4:
@@ -293,6 +354,13 @@ def ml_worker(ready: threading.Event):
             continue
         audio = audio[max(0, spans[0]["start"] - SAMPLE_RATE // 10):
                       spans[-1]["end"] + SAMPLE_RATE // 10]
+        # отпечаток голоса: чужую речь (ТВ, коллеги) не транскрибируем
+        if CONFIG["only_my_voice"] and voiceprint is not None:
+            sim = float(embed(audio) @ voiceprint)
+            if sim < CONFIG["vp_threshold"]:
+                print(f"  ✗ не твой голос (сходство {sim:.2f} < "
+                      f"{CONFIG['vp_threshold']}) — не вставляю", flush=True)
+                continue
         t0 = time.time()
         try:
             raw = mlx_whisper.transcribe(
@@ -310,24 +378,34 @@ def ml_worker(ready: threading.Event):
         if raw_words and raw_words <= hint_words:
             print(f"  ✗ похоже на эхо словаря, не вставляю: {raw}", flush=True)
             continue
+        app = frontmost_app()
+        style = style_for(app)
         text = raw
         t_llm = 0.0
-        if STATE["enhance"] and needs_enhance(raw):
-            t1 = time.time()
-            try:
+        t1 = time.time()
+        try:
+            if style == "translate":
+                text = llm_run(TRANSLATE_PROMPT, raw, max_factor=3) or raw
+            elif style == "formal":
+                text = enhance(raw, formal=True)
+            elif style == "raw":
+                pass
+            elif STATE["enhance"] and needs_enhance(raw):  # clean / casual
                 text = enhance(raw)
-            except Exception as e:
-                print(f"  ошибка чистки (вставляю сырой): {e}", flush=True)
-            t_llm = time.time() - t1
-        text = strip_short_period(text)
-        app = frontmost_app()
+        except Exception as e:
+            print(f"  ошибка обработки (вставляю сырой): {e}", flush=True)
+        t_llm = time.time() - t1
+        if style == "casual":
+            text = text.rstrip(".")
+        else:
+            text = strip_short_period(text)
         paste_text(text)
         db.execute("INSERT INTO transcriptions (ts, text, raw_text, duration, app) "
                    "VALUES (?, ?, ?, ?, ?)", (time.time(), text, raw, duration, app))
         db.commit()
         mark = "" if text == strip_short_period(raw) else f"  (сырой: {raw})"
-        print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s + llm {t_llm:.1f}s → {app}] "
-              f"{text}{mark}", flush=True)
+        print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s + llm {t_llm:.1f}s → "
+              f"{app}/{style}] {text}{mark}", flush=True)
 
 
 TAP_MAX = 0.35  # сек: короче — «тап» (toggle-режим), дольше — классический push-to-talk
@@ -346,7 +424,7 @@ def stop_and_submit():
         audio = np.concatenate(chunks).flatten().astype(np.float32)
         chunks.clear()
     if len(audio) / SAMPLE_RATE >= MIN_DURATION:
-        jobs.put(audio)
+        jobs.put(("dictate", audio))
 
 
 def cancel_recording():
@@ -395,7 +473,27 @@ class DictateApp(rumps.App):
         self.recent.add(rumps.MenuItem("пусто"))
         self.enh_item = rumps.MenuItem("LLM-чистка паразитов", callback=self.toggle_enhance)
         self.enh_item.state = int(STATE["enhance"])
+
+        self.profile = rumps.MenuItem("Профиль: …")
+        for key, label in [("default", "По умолчанию")] + list(STYLES.items()):
+            it = rumps.MenuItem(label, callback=self.set_profile)
+            it._style_key = key
+            self.profile.add(it)
+        self.default_style = rumps.MenuItem("Стиль по умолчанию")
+        for key, label in STYLES.items():
+            it = rumps.MenuItem(label, callback=self.set_default_style)
+            it._style_key = key
+            self.default_style.add(it)
+        self.translate_item = rumps.MenuItem("Перевод → EN (везде)", callback=self.toggle_translate)
+        self.translate_item.state = int(CONFIG["translate_all"])
+        self.vp_item = rumps.MenuItem("Только мой голос", callback=self.toggle_voice)
+        self.vp_item.state = int(CONFIG["only_my_voice"])
+
         self.menu = [self.mic_item, self.recent, None,
+                     self.profile, self.default_style, self.translate_item, None,
+                     self.vp_item,
+                     rumps.MenuItem("Записать отпечаток голоса (5 с)", callback=self.enroll),
+                     None,
                      self.enh_item,
                      rumps.MenuItem("Словарь терминов…", callback=self.open_terms),
                      rumps.MenuItem("Предложить термины из истории", callback=self.suggest),
@@ -406,6 +504,52 @@ class DictateApp(rumps.App):
     def refresh_title(self, _):
         self.title = "⏳" if STATE["loading"] else ("🔴" if recording else "🎤")
         self.mic_item.title = f"Микрофон: {STATE['mic']}"
+        app = frontmost_app() or STATE["app"]
+        STATE["app"] = app
+        cur = CONFIG["profiles"].get(app)
+        self.profile.title = f"Профиль «{app}»: " + (STYLES[cur] if cur else "по умолчанию")
+        for it in self.profile.values():
+            it.state = int((cur is None and it._style_key == "default") or it._style_key == cur)
+        for it in self.default_style.values():
+            it.state = int(it._style_key == CONFIG["default_style"])
+
+    def set_profile(self, sender):
+        app = STATE["app"]
+        if not app:
+            return
+        if sender._style_key == "default":
+            CONFIG["profiles"].pop(app, None)
+        else:
+            CONFIG["profiles"][app] = sender._style_key
+        save_config()
+
+    def set_default_style(self, sender):
+        CONFIG["default_style"] = sender._style_key
+        save_config()
+
+    def toggle_translate(self, sender):
+        CONFIG["translate_all"] = not CONFIG["translate_all"]
+        sender.state = int(CONFIG["translate_all"])
+        save_config()
+
+    def toggle_voice(self, sender):
+        if not os.path.exists(VOICEPRINT_PATH) and not CONFIG["only_my_voice"]:
+            rumps.alert("Только мой голос",
+                        "Сначала запиши отпечаток: пункт «Записать отпечаток голоса (5 с)».")
+            return
+        CONFIG["only_my_voice"] = not CONFIG["only_my_voice"]
+        sender.state = int(CONFIG["only_my_voice"])
+        save_config()
+
+    def enroll(self, _):
+        rumps.alert("Отпечаток голоса",
+                    "После ОК говори 5 секунд обычным голосом — любую фразу.")
+        def rec():
+            a = sd.rec(int(5 * SAMPLE_RATE), samplerate=SAMPLE_RATE,
+                       channels=1, dtype="float32")
+            sd.wait()
+            jobs.put(("enroll", a.flatten().astype(np.float32)))
+        threading.Thread(target=rec, daemon=True).start()
 
     def refresh_recent(self, _):
         try:
@@ -478,6 +622,7 @@ def request_permissions():
 
 
 def main():
+    load_config()
     request_permissions()
     print(f"Прогреваю модели ({ASR_MODEL.split('/')[-1]} + {LLM_MODEL.split('/')[-1]})...")
     ready = threading.Event()
