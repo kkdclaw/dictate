@@ -407,8 +407,10 @@ def ml_worker(ready: threading.Event):
                                          savedir=os.path.join(BASE, "models/ecapa"))
     ModelHolder.get_model(ASR_MODEL, mx.float16)
     from mlx_lm import load, stream_generate
+    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
     llm, tok = load(LLM_MODEL)
     last_stats = {}  # заполняется llm_run: gen_tps, prompt_tps, gen_tokens
+    pcache = {"cache": make_prompt_cache(llm), "tokens": []}  # KV-кэш префикса промпта
 
     for _ in stream_generate(llm, tok, prompt=tok.apply_chat_template(
             [{"role": "user", "content": "ок"}], add_generation_prompt=True),
@@ -437,14 +439,38 @@ def ml_worker(ready: threading.Event):
     def llm_run(system: str, user: str, max_factor: int = 2) -> str:
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         prompt = tok.apply_chat_template(msgs, add_generation_prompt=True)
-        parts, resp = [], None
-        for resp in stream_generate(llm, tok, prompt=prompt,
-                                    max_tokens=len(tok.encode(user)) * max_factor + 60):
-            parts.append(resp.text)
-        if resp is not None:
-            last_stats.update(gen_tps=resp.generation_tps, prompt_tps=resp.prompt_tps,
-                              gen_tokens=resp.generation_tokens)
-        return "".join(parts).strip()
+        cache, cached = pcache["cache"], pcache["tokens"]
+        # общий префикс с тем, что уже лежит в KV-кэше (константные правила+словарь)
+        common = 0
+        for x, y in zip(cached, prompt):
+            if x != y:
+                break
+            common += 1
+        try:
+            if len(cached) > common:  # откатить кэш до общего префикса
+                trim_prompt_cache(cache, len(cached) - common)
+            feed = prompt[common:]  # обрабатываем только новый хвост
+            parts, resp = [], None
+            for resp in stream_generate(llm, tok, prompt=feed, prompt_cache=cache,
+                                        max_tokens=len(tok.encode(user)) * max_factor + 40):
+                parts.append(resp.text)
+            if resp is not None:
+                trim_prompt_cache(cache, resp.generation_tokens)  # снять сгенерённое
+                pcache["tokens"] = prompt
+                last_stats.update(gen_tps=resp.generation_tps, prompt_tps=resp.prompt_tps,
+                                  gen_tokens=resp.generation_tokens)
+            return "".join(parts).strip()
+        except Exception as e:  # кэш рассинхронился — сбрасываем и идём без него
+            print(f"  кэш промпта сброшен: {e}", flush=True)
+            pcache["cache"], pcache["tokens"] = make_prompt_cache(llm), []
+            parts, resp = [], None
+            for resp in stream_generate(llm, tok, prompt=prompt,
+                                        max_tokens=len(tok.encode(user)) * max_factor + 40):
+                parts.append(resp.text)
+            if resp is not None:
+                last_stats.update(gen_tps=resp.generation_tps, prompt_tps=resp.prompt_tps,
+                                  gen_tokens=resp.generation_tokens)
+            return "".join(parts).strip()
 
     def enhance(raw: str, formal: bool = False, doubtful=None) -> str:
         system = system_prompt() + (FORMAL_PROMPT_ADDON if formal else "")
