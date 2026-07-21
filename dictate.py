@@ -118,15 +118,29 @@ def probe_rms(device) -> float:
         return 0.0
 
 
+SKIP_MICS = ("NoMachine",)  # виртуальные/нежелательные устройства в запасном выборе
+
+
 def pick_device():
-    """Вход по умолчанию, а если он молчит (AirPods в кейсе) — первый живой микрофон."""
+    """Доверяем системному входу по умолчанию (macOS сам переключает при AirPods
+    в кейсе). Пробуем его несколько раз — Bluetooth-микрофон просыпается не сразу.
+    Если он всё же мёртв — предпочитаем ВСТРОЕННЫЙ микрофон, а не Continuity-iPhone."""
     default = sd.query_devices(kind="input")
     default_idx = default["index"]
-    if probe_rms(default_idx) > 1e-5:
-        return default_idx, default["name"], True
+    for _ in range(4):  # ~1.4 c на пробуждение BT-микрофона
+        if probe_rms(default_idx) > 1e-5:
+            return default_idx, default["name"], True
+    devs = list(enumerate(sd.query_devices()))
+    # запасной приоритет: встроенный микрофон MacBook, потом остальные живые
+    builtin = [(i, d) for i, d in devs
+               if d["max_input_channels"] > 0 and "MacBook" in d["name"]]
+    for i, d in builtin:
+        if probe_rms(i) > 1e-5:
+            return i, d["name"], False
     best_idx, best_name, best_rms = None, None, 0.0
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] < 1 or i == default_idx or "NoMachine" in d["name"]:
+    for i, d in devs:
+        if (d["max_input_channels"] < 1 or i == default_idx
+                or any(s in d["name"] for s in SKIP_MICS)):
             continue
         rms = probe_rms(i)
         if rms > max(best_rms, 1e-5):
@@ -244,7 +258,9 @@ def system_prompt() -> str:
         "заменяй обычное слово термином из списка и один термин другим — исправляй "
         "словом из списка только явную ослышку, созвучную ему почти целиком.\n"
         "4. Слитные глаголы, разбитые на части, склей: «За деплой сервис» → «Задеплой сервис».\n"
-        "5. Если исправлять нечего — верни текст дословно.\n"
+        "5. Числа, цифры, номера, IP-адреса, суммы НИКОГДА не меняй — "
+        "переноси ровно как в исходнике.\n"
+        "6. Если исправлять нечего — верни текст дословно.\n"
         "Примеры: «филовер настроен» → «фейловер настроен»; «проверь зиро тир» → "
         "«проверь ZeroTier»; «MTG работает» → «MTG работает» (не менять!).\n"
         "Выведи ТОЛЬКО итоговый текст."
@@ -305,6 +321,19 @@ def _norm(s: str) -> str:
     return re.sub(r"[^\wёЁ-]+", " ", s).strip().lower()
 
 
+_TRANSLIT = {"а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+             "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+             "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+             "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+             "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya", " ": ""}
+
+
+def _roman(s: str) -> str:
+    # грубая романизация для сравнения кириллицы с латинскими терминами
+    # (зиро тир ~ zerotier, флинт ~ flint)
+    return "".join(_TRANSLIT.get(c, c) for c in s.lower())
+
+
 def guard_correction(raw: str, out: str, terms_lower: set) -> str:
     """Детерминированный пост-контроль LLM: замену слова принимаем, только если
     она созвучна исходному (обычный порог 0.55; если подставлен термин из
@@ -324,8 +353,17 @@ def guard_correction(raw: str, out: str, terms_lower: set) -> str:
         elif op == "insert":
             pass  # LLM не имеет права дописывать сама по себе
         else:  # replace
-            src, dst = _norm(" ".join(a[i1:i2])), _norm(" ".join(b[j1:j2]))
+            src_raw, dst_raw = " ".join(a[i1:i2]), " ".join(b[j1:j2])
+            # числа неприкосновенны: Whisper их берёт точно, «ремонт по созвучию»
+            # только портит (162→616). Изменились цифры — откат к сырому.
+            if re.findall(r"\d", src_raw + dst_raw) and \
+                    re.findall(r"\d+", src_raw) != re.findall(r"\d+", dst_raw):
+                result.extend(a[i1:i2])
+                continue
+            src, dst = _norm(src_raw), _norm(dst_raw)
             sim = difflib.SequenceMatcher(a=src, b=dst).ratio()
+            # кросс-скрипт: «флинт»/«зиро тир» vs латинский термин — сравним романизацию
+            sim = max(sim, difflib.SequenceMatcher(a=_roman(src), b=_roman(dst)).ratio())
             # подстановка термина (в любой словоформе: «роутера» ~ «роутер») —
             # строгая планка созвучности
             is_term = any(t and (dw.startswith(t) or t.startswith(dw))
@@ -453,9 +491,15 @@ def ml_worker(ready: threading.Event):
                   f"(просыпался после переключения?)", flush=True)
         # VAD: есть ли вообще речь, и если есть — обрезать тишину по краям
         spans = get_speech_timestamps(torch.from_numpy(audio), vad,
-                                      sampling_rate=SAMPLE_RATE, speech_pad_ms=150)
+                                      sampling_rate=SAMPLE_RATE, speech_pad_ms=150,
+                                      threshold=0.35)
         if not spans:
-            print("  ✗ речи не слышно — не вставляю", flush=True)
+            rms = float(np.sqrt((audio ** 2).mean()))
+            peak = float(np.abs(audio).max())
+            hint = ("захват почти пустой — микрофон не тот/тихий, "
+                    if peak < 0.02 else "сигнал есть, но VAD не распознал речь, ")
+            print(f"  ✗ речи не слышно ({hint}RMS={rms:.4f} peak={peak:.3f}) — "
+                  f"не вставляю", flush=True)
             continue
         audio = audio[max(0, spans[0]["start"] - SAMPLE_RATE // 4):
                       spans[-1]["end"] + SAMPLE_RATE // 10]
@@ -484,7 +528,8 @@ def ml_worker(ready: threading.Event):
             word = w["word"].strip()
             core = re.sub(r"[^\wёЁ-]", "", word)
             if (w["probability"] < 0.6 and i > 0 and len(core) >= 4
-                    and core.lower() not in STOP_DOUBT):
+                    and core.lower() not in STOP_DOUBT
+                    and not re.search(r"\d", core)):  # числа не «чиним»
                 doubtful.append(word)
         t_asr = time.time() - t0
         if not raw:
