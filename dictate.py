@@ -692,7 +692,7 @@ class DictateApp(rumps.App):
         rumps.Timer(self.refresh_recent, 3.0).start()
 
     def refresh_title(self, _):
-        self.title = "⏳" if STATE["loading"] else ("🔴" if recording else "🎤")
+        self.title = "⏳" if STATE["loading"] else ("🟠" if recording else "🎙️")
         self.mic_item.title = f"Микрофон: {STATE['mic']}"
         app = frontmost_app() or STATE["app"]
         STATE["app"] = app
