@@ -299,12 +299,21 @@ def history_db() -> sqlite3.Connection:
     return db
 
 
+MAX_REC_SEC = 600  # предохранитель: забытый toggle не пишет вечно — авто-стоп и обработка
+rec_frames = [0]  # счётчик сэмплов текущей записи (под lock)
+
 def audio_callback(indata, frames, t, status):
     stream_holder["last_cb"] = time.time()  # пульс: колбэки идут, пока устройство живо
+    overflow = False
     with lock:
         preroll.append(indata.copy())
         if recording:
             chunks.append(indata.copy())
+            rec_frames[0] += len(indata)
+            overflow = rec_frames[0] > MAX_REC_SEC * SAMPLE_RATE
+    if overflow and recording:
+        print(f"  ⏱ запись дольше {MAX_REC_SEC // 60} мин — авто-стоп и обработка", flush=True)
+        threading.Thread(target=stop_and_submit, daemon=True).start()
 
 
 FILLERS = re.compile(
@@ -615,6 +624,22 @@ TAP_MAX = 0.35  # сек: короче — «тап» (toggle-режим), до�
 
 toggle_mode = False
 press_time = 0.0
+# длительность удержания меряем по времени события В ЯДРЕ (CGEventTimestamp, нс),
+# а не по моменту доставки колбэка: под нагрузкой MLX события приходят пачкой
+# с опозданием, и настоящее удержание выглядело как «тап» → ложный toggle-режим
+_RALT_MASK = 0x40  # NX_DEVICERALTKEYMASK — бит именно правого Option
+kernel_ts = {"press": 0, "release": 0}
+
+
+def _tap_intercept(event_type, event):
+    if event_type == Quartz.kCGEventFlagsChanged:
+        keycode = Quartz.CGEventGetIntegerValueField(
+            event, Quartz.kCGKeyboardEventKeycode)
+        if keycode == 61:  # правый Option
+            which = ("press" if Quartz.CGEventGetFlags(event) & _RALT_MASK
+                     else "release")
+            kernel_ts[which] = Quartz.CGEventGetTimestamp(event)
+    return event
 
 
 def stop_and_submit():
@@ -652,6 +677,7 @@ def on_press(key):
         threading.Thread(target=ensure_stream, daemon=True).start()
         with lock:
             chunks.clear()
+            rec_frames[0] = 0
             # подклеиваем последние PREROLL_SEC до нажатия — первое слово не режется,
             # даже если начал говорить одновременно с клавишей
             need = int(PREROLL_SEC * SAMPLE_RATE)
@@ -672,9 +698,14 @@ def on_release(key):
     global toggle_mode
     if key != HOTKEY or not recording:
         return
-    if time.time() - press_time < TAP_MAX:
+    cb_hold = time.time() - press_time
+    k_hold = (kernel_ts["release"] - kernel_ts["press"]) / 1e9
+    hold = k_hold if 0 < k_hold < 3600 else cb_hold
+    lag = f" (колбэк {cb_hold:.2f}s)" if abs(cb_hold - hold) > 0.1 else ""
+    if hold < TAP_MAX:
         toggle_mode = True  # короткий тап: пишем дальше до второго тапа или Esc
-        print("  … toggle-режим: говори, ещё один тап Option — стоп, Esc — отмена", flush=True)
+        print(f"  … toggle-режим (тап {hold:.2f}s{lag}): говори, "
+              "ещё один тап Option — стоп, Esc — отмена", flush=True)
     else:
         stop_and_submit()  # классика: отпустил — обрабатываем
 
@@ -858,7 +889,8 @@ def main():
     threading.Thread(target=open_stream, daemon=True).start()
     threading.Thread(target=mic_watcher, daemon=True).start()
     watch_default_input(mic_changed.set)
-    keyboard.Listener(on_press=on_press, on_release=on_release).start()
+    keyboard.Listener(on_press=on_press, on_release=on_release,
+                      darwin_intercept=_tap_intercept).start()
     print("Меню-бар запущен. Зажми правый Option и говори; отпусти — текст вставится.")
     DictateApp().run()
 
