@@ -35,6 +35,34 @@ MIN_DURATION = 0.4  # сек; короче — случайное нажатие
 
 STATE = {"loading": True, "mic": "…", "enhance": True, "app": ""}
 
+ROLES = {  # роль -> (заголовок раздела, [(HF-репозиторий, ~полный размер МБ, подпись)])
+    "asr": ("Распознавание", [
+        ("mlx-community/whisper-large-v3-turbo", 1600,
+         "Whisper large-v3-turbo — быстрая"),
+        ("mlx-community/whisper-large-v3-mlx", 3100,
+         "Whisper large-v3 — точнее, в ~2 раза медленнее"),
+        ("mlx-community/whisper-medium-mlx", 1500,
+         "Whisper medium — лёгкая, качество ниже"),
+        ("mlx-community/whisper-large-v3-turbo-q4", 500,
+         "Whisper turbo 4-bit — для слабых машин, качество почти turbo"),
+        ("mlx-community/whisper-small-mlx", 500,
+         "Whisper small — совсем лёгкая, русский заметно хуже"),
+    ]),
+    "llm": ("Чистка текста", [
+        ("mlx-community/Qwen3-4B-Instruct-2507-4bit", 2300,
+         "Qwen3-4B — быстрая"),
+        ("mlx-community/Qwen3-1.7B-4bit", 1000,
+         "Qwen3-1.7B — для слабых машин"),
+        ("RockTalk/GigaChat3.1-10B-A1.8B-MLX-4bit", 6000,
+         "GigaChat 3.1 Lightning (MoE) — русскоцентричная, быстрая"),
+        ("mlx-community/Qwen3-14B-4bit", 8300,
+         "Qwen3-14B — качественнее, медленнее"),
+        ("mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit", 17200,
+         "Qwen3-30B-A3B (MoE) — лучшее качество"),
+    ]),
+}
+ROLE_CFG = {"asr": "asr_model", "llm": "llm_model"}  # роль -> ключ в config.json
+
 CONFIG_PATH = os.path.join(BASE, "config.json")
 VOICEPRINT_PATH = os.path.join(BASE, "voiceprint.npy")
 STYLES = {  # ключ -> подпись в меню
@@ -45,20 +73,73 @@ STYLES = {  # ключ -> подпись в меню
     "translate": "Перевод → EN",
 }
 CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
-          "translate_all": False, "vp_threshold": 0.40}
+          "translate_all": False, "vp_threshold": 0.40,
+          "asr_model": ASR_MODEL, "llm_model": LLM_MODEL}
 
 
 def load_config():
+    global ASR_MODEL, LLM_MODEL
     try:
         with open(CONFIG_PATH) as f:
             CONFIG.update(json.load(f))
     except (FileNotFoundError, ValueError):
         pass
+    ASR_MODEL = CONFIG["asr_model"]
+    LLM_MODEL = CONFIG["llm_model"]
 
 
 def save_config():
     with open(CONFIG_PATH, "w") as f:
         json.dump(CONFIG, f, ensure_ascii=False, indent=2)
+
+
+def _dir_size_mb(path: str) -> float:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            p = os.path.join(root, name)
+            try:
+                if not os.path.islink(p):  # snapshots в кэше HF — симлинки на blobs
+                    total += os.path.getsize(p)
+            except OSError:
+                pass
+    return total / 1e6
+
+
+def _fmt_mb(mb: float) -> str:
+    return f"{mb / 1000:.1f} ГБ" if mb >= 1000 else f"{mb:.0f} МБ"
+
+
+def _repo_dir(repo: str) -> str:
+    from huggingface_hub.constants import HF_HUB_CACHE
+    return os.path.join(HF_HUB_CACHE, "models--" + repo.replace("/", "--"))
+
+
+def _repo_status(repo: str, full_mb) -> dict:
+    """Модель в кэше HF: скачана / качается / нет, размер на диске, путь.
+
+    «Качается» — в blobs есть свежий *.incomplete (осиротевший после прерванной
+    закачки не считаем); «скачана» — в snapshots есть файлы и закачек нет."""
+    import glob
+    d = _repo_dir(repo)
+    if not os.path.isdir(d):
+        return {"path": d, "state": "none", "mb": 0.0, "full": full_mb}
+    incomplete = [p for p in glob.glob(os.path.join(d, "blobs", "*.incomplete"))
+                  if time.time() - os.path.getmtime(p) < 300]
+    snaps = glob.glob(os.path.join(d, "snapshots", "*", "*"))
+    state = "loading" if incomplete else ("done" if snaps else "none")
+    return {"path": d, "state": state, "mb": _dir_size_mb(d), "full": full_mb}
+
+
+def _model_row(label: str, st: dict, active: bool) -> str:
+    mark = "●" if active else "○"
+    if st["state"] == "done":
+        size = _fmt_mb(st["mb"])
+    elif st["state"] == "loading":
+        size = f"⏳ {_fmt_mb(st['mb'])} из ~{_fmt_mb(st['full'])}"
+    else:
+        size = f"не скачана (~{_fmt_mb(st['full'])})"
+    return f"{mark} {label} · {size}"
 
 
 def style_for(app: str) -> str:
@@ -734,12 +815,15 @@ class DictateApp(rumps.App):
         self.vp_item = rumps.MenuItem("Только мой голос", callback=self.toggle_voice)
         self.vp_item.state = int(CONFIG["only_my_voice"])
 
+        self.models_menu = rumps.MenuItem("Модели")
+
         self.menu = [self.mic_item, self.recent, None,
                      self.profile, self.default_style, self.translate_item, None,
                      self.vp_item,
                      rumps.MenuItem("Записать отпечаток голоса (5 с)", callback=self.enroll),
                      None,
                      self.enh_item,
+                     self.models_menu,
                      rumps.MenuItem("Статистика…", callback=self.open_stats),
                      rumps.MenuItem("Поиск истории…", callback=self.open_search),
                      rumps.MenuItem("Словарь терминов…", callback=self.open_terms),
@@ -747,6 +831,115 @@ class DictateApp(rumps.App):
                      rumps.MenuItem("Лог…", callback=self.open_log), None]
         rumps.Timer(self.refresh_title, 0.3).start()
         rumps.Timer(self.refresh_recent, 3.0).start()
+        self.refresh_models(None)
+        rumps.Timer(self.refresh_models, 5.0).start()
+
+    def refresh_models(self, _):
+        try:
+            snapshot = []  # (роль, заголовок, [(репо, подпись, статус, активна)])
+            for role, (title, options) in ROLES.items():
+                active = CONFIG[ROLE_CFG[role]]
+                rows = [(repo, label, _repo_status(repo, full), repo == active)
+                        for repo, full, label in options]
+                snapshot.append((role, title, rows))
+            aux = [("ECAPA-voxceleb — отпечаток голоса",
+                    _repo_status("speechbrain/spkrec-ecapa-voxceleb", 90))]
+            try:  # Silero VAD едет внутри pip-пакета, отдельно не скачивается
+                import silero_vad
+                d = os.path.dirname(silero_vad.__file__)
+                aux.append(("Silero VAD — детектор речи (в пакете)",
+                            {"path": d, "state": "done", "mb": _dir_size_mb(d),
+                             "full": None}))
+            except ImportError:
+                pass
+        except Exception:
+            return
+        sig = repr(snapshot) + repr(aux)
+        if sig == getattr(self, "_models_sig", ""):
+            return  # ничего не изменилось — не перестраиваем открытое меню
+        self._models_sig = sig
+        all_rows = [r for _, _, rows in snapshot for r in rows]
+        self.models_menu.title = (
+            "Модели: скачиваются…" if any(st["state"] == "loading"
+                                          for *_, st, _ in all_rows) else
+            "Модели" if all(st["state"] == "done"
+                            for *_, st, act in all_rows if act) else
+            "Модели: активная не скачана")
+        if self.models_menu._menu is not None:  # NSMenu появляется после первого add
+            self.models_menu.clear()
+        for role, title, rows in snapshot:
+            role_item = rumps.MenuItem(
+                f"{title}: {CONFIG[ROLE_CFG[role]].split('/')[-1]}")
+            for repo, label, st, is_active in rows:
+                row = rumps.MenuItem(_model_row(label, st, is_active))
+                if is_active:
+                    row.add(rumps.MenuItem("Активная модель"))
+                elif st["state"] == "done":
+                    act = rumps.MenuItem("Сделать активной (перезапуск)",
+                                         callback=self.activate_model)
+                    act._cfg_key, act._repo = ROLE_CFG[role], repo
+                    row.add(act)
+                    rm = rumps.MenuItem("Удалить с диска", callback=self.delete_model)
+                    rm._repo, rm._path = repo, st["path"]
+                    row.add(rm)
+                elif st["state"] == "none":
+                    dl = rumps.MenuItem(f"Скачать (~{_fmt_mb(st['full'])})",
+                                        callback=self.download_model)
+                    dl._repo = repo
+                    row.add(dl)
+                else:
+                    row.add(rumps.MenuItem("Скачивается…"))
+                if os.path.isdir(st["path"]):
+                    op = rumps.MenuItem("Открыть папку", callback=self.open_model_dir)
+                    op._model_path = st["path"]
+                    row.add(op)
+                role_item.add(row)
+            self.models_menu.add(role_item)
+        self.models_menu.add(None)
+        for label, st in aux:
+            item = rumps.MenuItem(f"✓ {label} · {_fmt_mb(st['mb'])}",
+                                  callback=self.open_model_dir)
+            item._model_path = st["path"]
+            self.models_menu.add(item)
+        from huggingface_hub.constants import HF_HUB_CACHE
+        cache_item = rumps.MenuItem(f"Кэш: {HF_HUB_CACHE.replace(os.path.expanduser('~'), '~')}",
+                                    callback=self.open_model_dir)
+        cache_item._model_path = HF_HUB_CACHE
+        self.models_menu.add(cache_item)
+
+    def activate_model(self, sender):
+        CONFIG[sender._cfg_key] = sender._repo
+        save_config()
+        print(f"Активная модель теперь {sender._repo} — перезапускаюсь "
+              f"(launchd поднимет заново)...", flush=True)
+        rumps.quit_application()  # KeepAlive в plist перезапустит с новой моделью
+
+    def download_model(self, sender):
+        repo = sender._repo
+        def dl():
+            try:
+                from huggingface_hub import snapshot_download
+                snapshot_download(repo)
+                print(f"Модель {repo} скачана.", flush=True)
+            except Exception as e:
+                print(f"  модель {repo} не скачалась: {e}", flush=True)
+        threading.Thread(target=dl, daemon=True).start()
+        self._models_sig = ""  # прогресс появится при следующем обновлении
+
+    def delete_model(self, sender):
+        if sender._repo in (CONFIG["asr_model"], CONFIG["llm_model"]):
+            rumps.alert("Модели", "Эта модель сейчас активна — сначала выбери другую.")
+            return
+        import shutil
+        shutil.rmtree(sender._path, ignore_errors=True)
+        print(f"Модель {sender._repo} удалена с диска.", flush=True)
+        self._models_sig = ""
+
+    def open_model_dir(self, sender):
+        path = sender._model_path
+        if not os.path.isdir(path):
+            path = os.path.dirname(path)
+        subprocess.run(["open", path])
 
     def refresh_title(self, _):
         self.title = "⏳" if STATE["loading"] else ("🟠" if recording else "🎙️")
@@ -855,34 +1048,112 @@ class DictateApp(rumps.App):
         subprocess.run(["open", "-t", os.path.join(BASE, "dictate.log")])
 
 
+PRIVACY_PANES = {  # разрешение -> раздел Настроек
+    "Микрофон": "Privacy_Microphone",
+    "Мониторинг ввода": "Privacy_ListenEvent",
+    "Универсальный доступ": "Privacy_Accessibility",
+}
+
+
 def request_permissions():
-    """При старте: проверить все три TCC-разрешения и запросить недостающие системными диалогами."""
+    """При старте: проверить все три TCC-разрешения и запросить недостающие.
+
+    Системный диалог macOS показывает только в статусе «не определён»; после
+    отказа молча отказывает — тогда открываем нужную панель Настроек сами и
+    показываем в Finder бинарник, который надо добавить в список."""
+    import sys
     import ctypes
     from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
     from AVFoundation import AVCaptureDevice
-    missing = []
-    # Микрофон: 3 = granted; запрос покажет системный диалог
-    if AVCaptureDevice.authorizationStatusForMediaType_("soun") != 3:
+    missing, denied = [], []
+    # Микрофон: 0 = не определён (запрос покажет диалог), 3 = выдано
+    mic = AVCaptureDevice.authorizationStatusForMediaType_("soun")
+    if mic != 3:
         AVCaptureDevice.requestAccessForMediaType_completionHandler_("soun", lambda ok: None)
         missing.append("Микрофон")
-    # Мониторинг ввода: 0 = granted; запрос добавит python3 в список и покажет диалог
+        if mic != 0:
+            denied.append("Микрофон")
+    # Мониторинг ввода: 0 = выдано, 1 = отказано, 2 = не определён (запрос покажет диалог)
     iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
-    if iokit.IOHIDCheckAccess(1) != 0:
+    hid = iokit.IOHIDCheckAccess(1)
+    if hid != 0:
         iokit.IOHIDRequestAccess(1)
         missing.append("Мониторинг ввода")
-    # Универсальный доступ: диалог со ссылкой в настройки
+        if hid == 1:
+            denied.append("Мониторинг ввода")
+    # Универсальный доступ: диалог со ссылкой в настройки (только при первом разе)
     if not AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}):
         missing.append("Универсальный доступ")
-    if missing:
-        print(f"⚠ Нет разрешений: {', '.join(missing)}. Выдай в Настройках → "
-              f"Конфиденциальность и перезапусти (daemon.sh restart).", flush=True)
-    else:
+        denied.append("Универсальный доступ")  # повторного диалога не будет
+    if not missing:
         print("Разрешения: все выданы.", flush=True)
+        return
+    binary = os.path.realpath(sys.executable)
+    print(f"⚠ Нет разрешений: {', '.join(missing)}. Процесс, которому надо их "
+          f"выдать: {binary}", flush=True)
+    if denied:
+        # диалогов не будет — ведём пользователя: Finder с бинарником (перетащи
+        # его в список «+») и панель Настроек первого недостающего разрешения
+        print(f"  Диалог система уже не покажет ({', '.join(denied)}) — открываю "
+              f"Настройки и Finder. Добавь бинарник в список (перетаскиванием), "
+              f"включи галку и сделай daemon.sh restart.", flush=True)
+        subprocess.run(["open", "-R", binary])
+        subprocess.run(["open", "x-apple.systempreferences:com.apple.preference."
+                        f"security?{PRIVACY_PANES[denied[0]]}"])
+
+
+def _choose_model_dialog(role: str) -> str | None:
+    """Нативный диалог со списком моделей роли; вернёт выбранный репозиторий.
+
+    None — пользователь закрыл диалог (останемся на дефолте)."""
+    title, options = ROLES[role]
+    active = CONFIG[ROLE_CFG[role]]
+    items, default = [], None
+    for repo, full, label in options:
+        st = _repo_status(repo, full)
+        suffix = "скачана" if st["state"] == "done" else f"скачается ~{_fmt_mb(full)}"
+        line = f"{label} · {suffix}"
+        items.append(line)
+        if repo == active:
+            default = line
+    lst = ", ".join('"%s"' % i.replace('"', "'") for i in items)
+    script = (f'choose from list {{{lst}}} with title "Dictate" with prompt '
+              f'"Первый запуск: модель для роли «{title}» ещё не скачана.\n'
+              f'Какую использовать? (Отмена — предложенная по умолчанию)" '
+              f'default items {{"{default}"}}')
+    try:
+        res = subprocess.run(["osascript", "-e", script], capture_output=True,
+                             text=True, timeout=600).stdout.strip()
+    except Exception:
+        return None
+    if res in items:
+        return options[items.index(res)][0]
+    return None  # false = отмена, пусто = таймаут
+
+
+def ask_first_download():
+    """Первая установка: активные модели не качаем молча — спрашиваем, какие брать."""
+    global ASR_MODEL, LLM_MODEL
+    changed = False
+    for role in ROLES:
+        cfg_key = ROLE_CFG[role]
+        repo = CONFIG[cfg_key]
+        full = next((f for r, f, _ in ROLES[role][1] if r == repo), 0)
+        if _repo_status(repo, full)["state"] != "none":
+            continue  # уже на диске (или качается) — вопросов нет
+        chosen = _choose_model_dialog(role)
+        if chosen and chosen != repo:
+            CONFIG[cfg_key] = chosen
+            changed = True
+    if changed:
+        save_config()
+        ASR_MODEL, LLM_MODEL = CONFIG["asr_model"], CONFIG["llm_model"]
 
 
 def main():
     load_config()
     request_permissions()
+    ask_first_download()
     print(f"Прогреваю модели ({ASR_MODEL.split('/')[-1]} + {LLM_MODEL.split('/')[-1]})...")
     ready = threading.Event()
     threading.Thread(target=ml_worker, args=(ready,), daemon=True).start()
