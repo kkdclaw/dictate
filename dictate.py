@@ -202,11 +202,28 @@ def probe_rms(device) -> float:
 SKIP_MICS = ("NoMachine",)  # виртуальные/нежелательные устройства в запасном выборе
 
 
+def _default_input(retries=6, delay=0.4):
+    """Вход по умолчанию. При смене BT-профиля (A2DP↔HFP) устройство на миг
+    исчезает и запрос падает с «device -1» — пробуем несколько раз,
+    перечитывая список устройств между попытками."""
+    for i in range(retries):
+        try:
+            return sd.query_devices(kind="input")
+        except Exception:
+            if i == retries - 1:
+                raise
+            time.sleep(delay)
+            try:
+                sd._terminate(); sd._initialize()
+            except Exception:
+                pass
+
+
 def pick_device():
     """Доверяем системному входу по умолчанию (macOS сам переключает при AirPods
     в кейсе). Пробуем его несколько раз — Bluetooth-микрофон просыпается не сразу.
     Если он всё же мёртв — предпочитаем ВСТРОЕННЫЙ микрофон, а не Continuity-iPhone."""
-    default = sd.query_devices(kind="input")
+    default = _default_input()
     default_idx = default["index"]
     for _ in range(4):  # ~1.4 c на пробуждение BT-микрофона
         if probe_rms(default_idx) > 1e-5:
@@ -246,15 +263,18 @@ def reopen_stream(follow_default=False):
     open_stream(follow_default=follow_default)
 
 
+def stream_alive() -> bool:
+    """Поток открыт и колбэки идут (пульс не старше 2 с)."""
+    s = stream_holder.get("stream")
+    try:
+        return bool(s) and s.active and time.time() - stream_holder.get("last_cb", 0) < 2.0
+    except Exception:
+        return False
+
+
 def ensure_stream():
     """Перед записью: если поток умер или пульс пропал (микрофон отвалился) — переоткрыть."""
-    s = stream_holder.get("stream")
-    alive = False
-    try:
-        alive = bool(s) and s.active and time.time() - stream_holder.get("last_cb", 0) < 2.0
-    except Exception:
-        pass
-    if not alive:
+    if not stream_alive():
         print("  микрофон пропал — переоткрываю...", flush=True)
         try:
             # follow_default: без проб устройств, окно потери звука минимально;
@@ -271,7 +291,7 @@ def open_stream(follow_default=False):
         old.close()
     if follow_default:
         # смена входа по умолчанию — это действие пользователя, верим без проб
-        d = sd.query_devices(kind="input")
+        d = _default_input()
         dev, name, is_default = d["index"], d["name"], True
     else:
         dev, name, is_default = pick_device()
@@ -300,6 +320,10 @@ def mic_watcher():
             reopen_stream(follow_default=True)
         except Exception as e:
             print(f"  не удалось переключить микрофон: {e}", flush=True)
+        # открытие потока на AirPods само переводит их A2DP→HFP, и CoreAudio
+        # сыплет новые события «вход сменился» — глотаем их, иначе цикл
+        time.sleep(2.0)
+        mic_changed.clear()
 
 
 def load_terms() -> str:
@@ -942,7 +966,9 @@ class DictateApp(rumps.App):
         subprocess.run(["open", path])
 
     def refresh_title(self, _):
-        self.title = "⏳" if STATE["loading"] else ("🟠" if recording else "🎙️")
+        # ⚠️ — поток мёртв/переоткрывается: жать Option рано, звук потеряется
+        self.title = ("⏳" if STATE["loading"] else "🟠" if recording
+                      else "🎙️" if stream_alive() else "⚠️")
         self.mic_item.title = f"Микрофон: {STATE['mic']}"
         app = frontmost_app() or STATE["app"]
         STATE["app"] = app
