@@ -248,19 +248,25 @@ def pick_device():
     return default_idx, default["name"], True  # все молчат — остаёмся на дефолте
 
 
+reopen_lock = threading.Lock()  # переоткрытия идут из разных потоков (вотчер
+# смены входа, нажатие Option, вочдог); параллельные sd._terminate/_initialize
+# ломают PortAudio так, что все запросы устройств возвращают -1 до рестарта
+
+
 def reopen_stream(follow_default=False):
     """Полный перезапуск аудио: закрыть поток, перечитать устройства CoreAudio, открыть заново."""
-    old = stream_holder.pop("stream", None)
-    if old:
+    with reopen_lock:
+        old = stream_holder.pop("stream", None)
+        if old:
+            try:
+                old.stop(); old.close()
+            except Exception:
+                pass
         try:
-            old.stop(); old.close()
+            sd._terminate(); sd._initialize()
         except Exception:
             pass
-    try:
-        sd._terminate(); sd._initialize()
-    except Exception:
-        pass
-    open_stream(follow_default=follow_default)
+        open_stream(follow_default=follow_default)
 
 
 def stream_alive() -> bool:
@@ -274,14 +280,17 @@ def stream_alive() -> bool:
 
 def ensure_stream():
     """Перед записью: если поток умер или пульс пропал (микрофон отвалился) — переоткрыть."""
-    if not stream_alive():
-        print("  микрофон пропал — переоткрываю...", flush=True)
-        try:
-            # follow_default: без проб устройств, окно потери звука минимально;
-            # если дефолт окажется мёртвым, сработает фолбэк по тихой записи
-            reopen_stream(follow_default=True)
-        except Exception as e:
-            print(f"  не удалось открыть микрофон: {e}", flush=True)
+    if stream_alive():
+        return
+    if reopen_lock.locked():
+        return  # кто-то уже переоткрывает — не вставать в очередь
+    print("  микрофон пропал — переоткрываю...", flush=True)
+    try:
+        # follow_default: без проб устройств, окно потери звука минимально;
+        # если дефолт окажется мёртвым, сработает фолбэк по тихой записи
+        reopen_stream(follow_default=True)
+    except Exception as e:
+        print(f"  не удалось открыть микрофон: {e}", flush=True)
 
 
 def open_stream(follow_default=False):
@@ -305,6 +314,47 @@ def open_stream(follow_default=False):
 
 
 mic_changed = threading.Event()
+
+
+def stream_watchdog():
+    """Мёртвый поток чинится сам, не дожидаясь событий CoreAudio или нажатия.
+
+    Если входов нет вообще (Mac Studio без встроенного микрофона, AirPods
+    в кейсе) — тихо ждём появления, опрашивая раз в 3 с. Иначе — полное
+    переоткрытие с пробами устройств; интервал неудачных попыток растёт
+    до 30 с, чтобы не заливать лог."""
+    fails = 0
+    waiting = False
+    while True:
+        time.sleep(min(30.0, 3.0 * (fails + 1)))
+        if recording or stream_alive() or reopen_lock.locked():
+            fails = 0
+            waiting = False
+            continue
+        with reopen_lock:  # перечитка списка устройств, сериализовано
+            try:
+                sd._terminate(); sd._initialize()
+                have_input = any(d["max_input_channels"] > 0
+                                 for d in sd.query_devices())
+            except Exception:
+                have_input = True  # спросить не вышло — пробуем открыть как обычно
+        if not have_input:
+            if not waiting:
+                print("  входных устройств нет (AirPods в кейсе?) — жду появления...",
+                      flush=True)
+                waiting = True
+            STATE["mic"] = "нет — подключи микрофон"
+            fails = 0  # ждём молча, опрос каждые 3 с
+            continue
+        waiting = False
+        try:
+            print("  поток мёртв — вочдог переоткрывает...", flush=True)
+            reopen_stream()
+            fails = 0
+        except Exception as e:
+            fails += 1
+            print(f"  вочдог: не удалось ({e}), следующая попытка через "
+                  f"{min(30, 3 * (fails + 1))} с", flush=True)
 
 
 def mic_watcher():
@@ -1185,6 +1235,7 @@ def main():
     threading.Thread(target=ml_worker, args=(ready,), daemon=True).start()
     threading.Thread(target=open_stream, daemon=True).start()
     threading.Thread(target=mic_watcher, daemon=True).start()
+    threading.Thread(target=stream_watchdog, daemon=True).start()
     watch_default_input(mic_changed.set)
     keyboard.Listener(on_press=on_press, on_release=on_release,
                       darwin_intercept=_tap_intercept).start()
