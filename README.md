@@ -6,7 +6,10 @@ Pipeline: Silero VAD → Whisper large-v3-turbo on MLX (with a user dictionary
 fed via `initial_prompt` — the main quality lever for jargon) → optional
 filler-word cleanup by a local Qwen3-4B (runs only when needed) → paste via
 synthetic ⌘V → SQLite history. Ships as a menu bar app with a launchd daemon
-(auto-start, self-healing microphone selection, permission bootstrap).
+(auto-start, self-healing microphone selection, permission bootstrap), a
+caret-anchored recording capsule with level meter, sound cues, a status window
+(service / TCC permissions / microphone / models / hotkey), and a model manager
+(Whisper large-v3, medium, 4-bit; Qwen3 1.7B–30B, GigaChat) — pick per machine.
 Docs below are in Russian; the code and `daemon.sh` are self-explanatory.
 Install: `uv sync && ./daemon.sh install`. License: MIT.
 
@@ -71,7 +74,9 @@ HuggingFace (предложит дефолтные: Whisper large-v3-turbo + Qwe
 ## Интерфейс (меню-бар)
 
 Иконка показывает состояние: **⏳** модели греются (после старта ~20–30 с) →
-**🎤** готов → **🔴** идёт запись.
+**🎙️** готов → **🟠** идёт запись; **⚠️** — аудиопоток не отдаёт данные (нет ни
+одного микрофона: Mac Studio без встроенного, AirPods в кейсе) — как только
+микрофон появится, подхватится сам.
 
 Во время записи у текстового курсора появляется **капсула-индикатор** со
 столбиками уровня (после отпускания клавиши — пульсирующие точки «распознаю»),
@@ -108,8 +113,10 @@ HuggingFace (предложит дефолтные: Whisper large-v3-turbo + Qwe
   отказа. Если вывод по умолчанию — Bluetooth-наушники, звуки идут во
   встроенный динамик Mac: звук в AirPods перещёлкивает их профиль, и микрофон
   на 1–2 с отдаёт тишину;
-- **Модели** — разделы по ролям (распознавание, чистка текста): что скачано,
-  что качается, сколько весит; скачать/удалить/сделать активной;
+- **Модели** — разделы по ролям (распознавание: Whisper large-v3-turbo /
+  large-v3 / medium / turbo-4bit / small; чистка текста: Qwen3-4B / 1.7B / 14B /
+  30B-A3B, GigaChat 3.1 Lightning): что скачано, что качается (X из Y), сколько
+  весит; скачать / удалить / сделать активной (перезапуск), открыть папку кэша;
 - **Словарь терминов…** — открывает `terms.txt` в текстовом редакторе;
   правки подхватываются на лету, перезапуск не нужен;
 - **Лог…** — открывает `dictate.log`: каждая диктовка с таймингами
