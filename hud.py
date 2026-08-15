@@ -45,8 +45,24 @@ ICONS = {  # что рисуем внутри капсулы во время з�
 }
 BACKGROUNDS = {"system": "Как в системе", "dark": "Тёмный", "light": "Светлый"}
 POSITIONS = {"caret": "У текстового курсора", "bottom": "Внизу экрана"}
+SOUND_EVENTS = {  # событие -> (подпись, звук по умолчанию)
+    "start": ("Звук старта записи", "Tink"),
+    "done": ("Звук вставки", "Pop"),
+    "error": ("Звук отказа (пусто/не речь)", "Basso"),
+}
 DEFAULTS = {"hud": True, "hud_size": "small", "hud_icon": "bars", "hud_color": "red",
-            "hud_bg": "system", "hud_pos": "caret", "sounds": True}
+            "hud_bg": "system", "hud_pos": "caret", "sounds": True,
+            "sound_start": "Tink", "sound_done": "Pop", "sound_error": "Basso"}
+SOUNDS_DIR = "/System/Library/Sounds"
+
+
+def system_sounds() -> list:
+    """Имена системных звуков macOS (Basso, Blow, … Tink)."""
+    try:
+        import os
+        return sorted(f[:-5] for f in os.listdir(SOUNDS_DIR) if f.endswith(".aiff"))
+    except Exception:
+        return ["Tink", "Pop", "Basso"]
 
 BARS = 5
 _cfg = dict(DEFAULTS)
@@ -74,28 +90,108 @@ def push_level(rms: float):
 
 
 # --- звуки --------------------------------------------------------------------
-_sounds = {}
-_SOUND_FILES = {"start": ("Tink", 0.55), "done": ("Pop", 0.45), "error": ("Basso", 0.30)}
+# Важно: если вывод по умолчанию — Bluetooth (AirPods), звук в них НЕЛЬЗЯ:
+# наушники перещёлкивают профиль A2DP↔HFP, и микрофон на пару секунд отдаёт
+# нули (диктовка «ломается после двух слов»). Тогда играем во встроенный
+# динамик Mac; если его нет — молчим.
+_sounds = {}  # имя файла -> NSSound
+_VOLUME = {"start": 0.55, "done": 0.45, "error": 0.30}
+_route = {"ts": 0.0, "uid": None, "reason": ""}
 
 
-def _play_main(kind):
-    snd = _sounds.get(kind)
+def _sound_route():
+    """UID устройства для звуков: None = дефолтный вывод, '' = не играть."""
+    now = time.time()
+    if now - _route["ts"] < 5.0:
+        return _route["uid"]
+    uid, reason = None, "вывод по умолчанию"
+    try:
+        import ctypes
+        ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        cf.CFStringGetCString.restype = ctypes.c_bool
+
+        class Addr(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32),
+                        ("element", ctypes.c_uint32)]
+
+        def fcc(x):
+            return int.from_bytes(x.encode(), "big")
+
+        def size(obj, sel, scope="glob"):
+            a = Addr(fcc(sel), fcc(scope), 0)
+            n = ctypes.c_uint32(0)
+            ca.AudioObjectGetPropertyDataSize(obj, ctypes.byref(a), 0, None, ctypes.byref(n))
+            return n.value
+
+        def get(obj, sel, buf, scope="glob"):
+            a = Addr(fcc(sel), fcc(scope), 0)
+            n = ctypes.c_uint32(ctypes.sizeof(buf))
+            return ca.AudioObjectGetPropertyData(obj, ctypes.byref(a), 0, None,
+                                                 ctypes.byref(n), ctypes.byref(buf))
+
+        def cfstr(ref):
+            b = ctypes.create_string_buffer(256)
+            cf.CFStringGetCString(ref, b, 256, 0x08000100)
+            return b.value.decode()
+
+        dout = ctypes.c_uint32()
+        get(1, "dOut", dout)
+        tt = ctypes.c_uint32()
+        get(dout.value, "tran", tt)
+        if tt.value == fcc("blue"):
+            uid, reason = "", "вывод — Bluetooth, встроенного динамика нет"
+            n = size(1, "dev#") // 4
+            ids = (ctypes.c_uint32 * n)()
+            get(1, "dev#", ids)
+            for d in ids:
+                t2 = ctypes.c_uint32()
+                get(d, "tran", t2)
+                if t2.value == fcc("bltn") and size(d, "stm#", "outp"):
+                    ref = ctypes.c_void_p()
+                    get(d, "uid ", ref)
+                    uid, reason = cfstr(ref), "вывод — Bluetooth, звуки во встроенный динамик"
+                    break
+    except Exception as e:  # noqa
+        uid, reason = None, f"не определил вывод ({e})"
+    _route.update(ts=now, uid=uid, reason=reason)
+    return uid
+
+
+def sound_route_info() -> str:
+    _sound_route()
+    return _route["reason"]
+
+
+def _play_main(name, volume):
+    route = _sound_route()
+    if route == "" or not name or name == "none":
+        return
+    snd = _sounds.get(name)
     if snd is None:
-        name, vol = _SOUND_FILES[kind]
         snd = AppKit.NSSound.alloc().initWithContentsOfFile_byReference_(
-            f"/System/Library/Sounds/{name}.aiff", True)
+            f"{SOUNDS_DIR}/{name}.aiff", True)
         if snd is None:
             return
-        snd.setVolume_(vol)
-        _sounds[kind] = snd
+        _sounds[name] = snd
+    snd.setVolume_(volume)
+    try:
+        snd.setPlaybackDeviceIdentifier_(route)  # None = дефолт
+    except Exception:
+        pass
     snd.stop()
     snd.play()
 
 
 def play(kind: str):
     """start | done | error — с любого потока; молчит, если звуки выключены."""
-    if _cfg.get("sounds", True) and kind in _SOUND_FILES:
-        AppHelper.callAfter(_play_main, kind)
+    if _cfg.get("sounds", True) and kind in SOUND_EVENTS:
+        AppHelper.callAfter(_play_main, _cfg.get(f"sound_{kind}"), _VOLUME[kind])
+
+
+def preview_sound(name: str):
+    """Проиграть звук по имени (выбор в меню) — с любого потока."""
+    AppHelper.callAfter(_play_main, name, 0.5)
 
 
 # --- позиция: каретка через Accessibility -----------------------------------

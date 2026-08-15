@@ -688,6 +688,15 @@ def ml_worker(ready: threading.Event):
             if len(nz) and nz[0] > SAMPLE_RATE * 0.25:
                 print(f"  ⚠ микрофон молчал первые {nz[0] / SAMPLE_RATE:.2f}с записи "
                       f"(просыпался после переключения?)", flush=True)
+            # провалы в нули ВНУТРИ записи = Bluetooth перещёлкивал профиль
+            # (звук в AirPods, вызов и т.п.) — речь в этих местах потеряна
+            if len(nz) > 1:
+                gaps = np.diff(nz)
+                big = gaps[gaps > SAMPLE_RATE * 0.2]
+                if len(big):
+                    print(f"  ⚠ внутри записи {len(big)} провал(а) в нули, суммарно "
+                          f"{big.sum() / SAMPLE_RATE:.1f}с — микрофон отваливался "
+                          f"(Bluetooth-профиль?)", flush=True)
             # VAD: есть ли вообще речь, и если есть — обрезать тишину по краям
             spans = get_speech_timestamps(torch.from_numpy(audio), vad,
                                           sampling_rate=SAMPLE_RATE, speech_pad_ms=150,
@@ -914,9 +923,6 @@ class DictateApp(rumps.App):
         self.models_menu = rumps.MenuItem("Модели")
         self.status_item = rumps.MenuItem("Состояние и разрешения…", callback=self.open_status)
         self.hud_menu = self._build_hud_menu()
-        self.sounds_item = rumps.MenuItem("Звуки (старт / вставлено / отброшено)",
-                                          callback=self.toggle_sounds)
-        self.sounds_item.state = int(CONFIG["sounds"])
 
         self.menu = [self.status_item, self.mic_item, self.recent, None,
                      self.profile, self.default_style, self.translate_item, None,
@@ -924,7 +930,7 @@ class DictateApp(rumps.App):
                      rumps.MenuItem("Записать отпечаток голоса (5 с)", callback=self.enroll),
                      None,
                      self.enh_item,
-                     self.hud_menu, self.sounds_item,
+                     self.hud_menu,
                      self.models_menu,
                      rumps.MenuItem("Статистика…", callback=self.open_stats),
                      rumps.MenuItem("Поиск истории…", callback=self.open_search),
@@ -949,11 +955,10 @@ class DictateApp(rumps.App):
 
     # --- индикатор записи и звуки -------------------------------------------
     def _build_hud_menu(self):
-        m = rumps.MenuItem("Индикатор записи")
-        self.hud_on = rumps.MenuItem("Показывать капсулу", callback=self.toggle_hud)
+        m = rumps.MenuItem("Индикатор и звуки")
+        self.hud_on = rumps.MenuItem("Показывать капсулу при записи", callback=self.toggle_hud)
         m.add(self.hud_on)
-        m.add(rumps.MenuItem("Показать пример (2 с)", callback=lambda _: hud.preview()))
-        m.add(None)
+        m.add(rumps.MenuItem("Показать пример капсулы (2 с)", callback=lambda _: hud.preview()))
         self.hud_groups = {}
         groups = [("hud_size", "Размер", {k: v[0] for k, v in hud.SIZES.items()}),
                   ("hud_icon", "Иконка", hud.ICONS),
@@ -968,14 +973,36 @@ class DictateApp(rumps.App):
                 sub.add(it)
             self.hud_groups[key] = sub
             m.add(sub)
+        m.add(None)
+        self.sounds_item = rumps.MenuItem("Звуки включены", callback=self.toggle_sounds)
+        m.add(self.sounds_item)
+        names = hud.system_sounds()
+        for ev, (title, _default) in hud.SOUND_EVENTS.items():
+            sub = rumps.MenuItem(title)
+            for name in ["none"] + names:
+                it = rumps.MenuItem("Без звука" if name == "none" else name,
+                                    callback=self.set_sound)
+                it._opt = (f"sound_{ev}", name)
+                sub.add(it)
+            self.hud_groups[f"sound_{ev}"] = sub
+            m.add(sub)
         self._sync_hud_menu()
         return m
 
+    def set_sound(self, sender):
+        key, name = sender._opt
+        CONFIG[key] = name
+        save_config()
+        hud.configure(CONFIG)
+        self._sync_hud_menu()
+        hud.preview_sound(name)
+
     def _sync_hud_menu(self):
         self.hud_on.state = int(CONFIG["hud"])
+        self.sounds_item.state = int(CONFIG["sounds"])
         for key, sub in self.hud_groups.items():
             for it in sub.values():
-                it.state = int(it._opt[1] == CONFIG[key])
+                it.state = int(it._opt[1] == CONFIG.get(key))
 
     def toggle_hud(self, sender):
         CONFIG["hud"] = not CONFIG["hud"]
@@ -993,9 +1020,9 @@ class DictateApp(rumps.App):
 
     def toggle_sounds(self, sender):
         CONFIG["sounds"] = not CONFIG["sounds"]
-        sender.state = int(CONFIG["sounds"])
         save_config()
         hud.configure(CONFIG)
+        self._sync_hud_menu()
         if CONFIG["sounds"]:
             hud.play("done")
 
@@ -1104,7 +1131,9 @@ class DictateApp(rumps.App):
             hk = "⏸ ждёт разрешения «Мониторинг ввода»"
         else:
             hk = "нажми правый Option — здесь появится ✅"
-        hot = [("Правый Option", hk, "Проверить индикатор", "hud_test")]
+        snd = "выключены" if not CONFIG["sounds"] else hud.sound_route_info()
+        hot = [("Правый Option", hk, "Проверить индикатор", "hud_test"),
+               ("Звуки", snd, None, None)]
         return [("Служба", service), ("Разрешения", prows), ("Микрофон", mic),
                 ("Модели", mrows), ("Хоткей и индикатор", hot)]
 
