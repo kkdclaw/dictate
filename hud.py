@@ -30,16 +30,25 @@ COLORS = {  # ключ -> (подпись, RGB 0..1)
     "green": ("Зелёный", (0.2, 0.78, 0.35)),
     "white": ("Белый", (1.0, 1.0, 1.0)),
 }
-SIZES = {"compact": ("Компактный", 1.15), "standard": ("Обычный", 1.5),
-         "large": ("Крупный", 1.85)}
+SIZES = {  # ключ -> (подпись, (ширина, высота) в пунктах)
+    "tiny": ("Супермаленький", (30.0, 12.0)),
+    "small": ("Маленький", (46.0, 20.0)),
+    "normal": ("Обычный", (64.0, 28.0)),
+}
+_LEGACY_SIZES = {"compact": "tiny", "standard": "small", "large": "normal"}
+ICONS = {  # что рисуем внутри капсулы во время записи
+    "bars": "Столбики уровня",
+    "dot": "Точка (пульсирует от громкости)",
+    "ring": "Кольцо",
+    "mic": "Микрофон",
+    "wave": "Волна",
+}
 BACKGROUNDS = {"system": "Как в системе", "dark": "Тёмный", "light": "Светлый"}
 POSITIONS = {"caret": "У текстового курсора", "bottom": "Внизу экрана"}
-DEFAULTS = {"hud": True, "hud_size": "standard", "hud_color": "red",
+DEFAULTS = {"hud": True, "hud_size": "small", "hud_icon": "bars", "hud_color": "red",
             "hud_bg": "system", "hud_pos": "caret", "sounds": True}
 
-BASE_W, BASE_H = 64.0, 38.0
 BARS = 5
-
 _cfg = dict(DEFAULTS)
 _levels = []  # последние RMS-уровни (пишет аудиопоток, читает вью)
 _state = {"mode": None, "shown_at": 0.0}
@@ -50,6 +59,9 @@ def configure(cfg: dict):
     for k in DEFAULTS:
         if k in cfg:
             _cfg[k] = cfg[k]
+    if _cfg["hud_size"] in _LEGACY_SIZES:  # старые ключи размера из config.json
+        _cfg["hud_size"] = _LEGACY_SIZES[_cfg["hud_size"]]
+        cfg["hud_size"] = _cfg["hud_size"]
     if _panel is not None:
         AppHelper.callAfter(_relayout)
 
@@ -187,31 +199,93 @@ class HUDView(AppKit.NSView):
         accent = AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, bl, 1.0)
         t = time.time()
         mode = _state["mode"]
+        tiny = h < 16
         if mode == "rec":
-            # столбики уровня: последние BARS отсчётов, справа — самый свежий
-            lv = _levels[-BARS:] if _levels else []
-            lv = [0.0] * (BARS - len(lv)) + lv
-            gap = h * 0.12
-            bw = min(h * 0.16, (w - 2 * h * 0.35) / BARS - gap)
-            total = BARS * bw + (BARS - 1) * gap
-            x0 = (w - total) / 2
-            for i, v in enumerate(lv):
-                pulse = 0.5 + 0.5 * math.sin(t * 6 + i)  # лёгкое дыхание в тишине
-                bh = h * 0.16 + (h * 0.5) * max(v, 0.08 * pulse)
-                rr = NSMakeRect(x0 + i * (bw + gap), (h - bh) / 2, bw, bh)
+            lv = _levels[-6:] if _levels else [0.0]
+            level = max(lv[-1], 0.0)
+            icon = _cfg.get("hud_icon", "bars")
+            if icon == "bars":
+                _draw_bars(w, h, accent, t, tiny)
+            elif icon == "dot":
+                d = h * (0.36 + 0.42 * min(1.0, level * 1.5))
                 accent.setFill()
-                AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                    rr, bw / 2, bw / 2).fill()
+                AppKit.NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect((w - d) / 2, (h - d) / 2, d, d)).fill()
+            elif icon == "ring":
+                d0 = h * 0.42
+                accent.setFill()
+                AppKit.NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect((w - d0) / 2, (h - d0) / 2, d0, d0)).fill()
+                ph = (t * 1.6) % 1.0  # расходящееся кольцо
+                d1 = d0 + (h * 0.5) * ph
+                accent.colorWithAlphaComponent_(1.0 - ph).setStroke()
+                ring = AppKit.NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect((w - d1) / 2, (h - d1) / 2, d1, d1))
+                ring.setLineWidth_(max(1.0, h * 0.08))
+                ring.stroke()
+            else:  # mic / wave — SF Symbol, яркость от громкости
+                name = "mic.fill" if icon == "mic" else "waveform"
+                img = _symbol(name, h * 0.62, accent)
+                if img is not None:
+                    a = 0.55 + 0.45 * min(1.0, level * 1.5)
+                    sz = img.size()
+                    img.drawInRect_fromRect_operation_fraction_(
+                        NSMakeRect((w - sz.width) / 2, (h - sz.height) / 2, sz.width, sz.height),
+                        AppKit.NSZeroRect, AppKit.NSCompositingOperationSourceOver, a)
+                else:
+                    _draw_bars(w, h, accent, t, tiny)
         elif mode == "busy":
-            d = h * 0.18
+            n = 1 if tiny else 3
+            d = h * (0.4 if tiny else 0.2)
             gap = d * 0.9
-            total = 3 * d + 2 * gap
+            total = n * d + (n - 1) * gap
             x0 = (w - total) / 2
-            for i in range(3):
+            for i in range(n):
                 a = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 5 - i * 1.1))
                 accent.colorWithAlphaComponent_(a).setFill()
                 AppKit.NSBezierPath.bezierPathWithOvalInRect_(
                     NSMakeRect(x0 + i * (d + gap), (h - d) / 2, d, d)).fill()
+
+def _draw_bars(w, h, accent, t, tiny):
+    n = 3 if tiny else BARS
+    lv = _levels[-n:] if _levels else []
+    lv = [0.0] * (n - len(lv)) + lv
+    gap = h * 0.14
+    bw = max(1.5, min(h * 0.18, (w - h) / n - gap))
+    total = n * bw + (n - 1) * gap
+    x0 = (w - total) / 2
+    for i, v in enumerate(lv):
+        pulse = 0.5 + 0.5 * math.sin(t * 6 + i)  # лёгкое дыхание в тишине
+        bh = h * 0.2 + (h * 0.55) * max(v, 0.08 * pulse)
+        rr = NSMakeRect(x0 + i * (bw + gap), (h - bh) / 2, bw, bh)
+        accent.setFill()
+        AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            rr, bw / 2, bw / 2).fill()
+
+
+_symbols = {}
+
+
+def _symbol(name, size, color):
+    key = (name, round(size, 1), color.description())
+    if key in _symbols:
+        return _symbols[key]
+    img = None
+    try:
+        img = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+        if img is not None:
+            cfg = AppKit.NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                size, AppKit.NSFontWeightSemibold)
+            try:
+                cfg = cfg.configurationByApplyingConfiguration_(
+                    AppKit.NSImageSymbolConfiguration.configurationWithHierarchicalColor_(color))
+            except Exception:
+                pass
+            img = img.imageWithSymbolConfiguration_(cfg)
+    except Exception:
+        img = None
+    _symbols[key] = img
+    return img
 
 
 class _Ticker(NSObject):
@@ -227,8 +301,7 @@ _ticker = _Ticker.alloc().init()
 
 
 def _size():
-    k = SIZES.get(_cfg["hud_size"], SIZES["standard"])[1]
-    return BASE_W * k, BASE_H * k
+    return SIZES.get(_cfg["hud_size"], SIZES["small"])[1]
 
 
 def _ensure_panel():

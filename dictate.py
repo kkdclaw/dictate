@@ -956,6 +956,7 @@ class DictateApp(rumps.App):
         m.add(None)
         self.hud_groups = {}
         groups = [("hud_size", "Размер", {k: v[0] for k, v in hud.SIZES.items()}),
+                  ("hud_icon", "Иконка", hud.ICONS),
                   ("hud_color", "Цвет", {k: v[0] for k, v in hud.COLORS.items()}),
                   ("hud_bg", "Фон", hud.BACKGROUNDS),
                   ("hud_pos", "Положение", hud.POSITIONS)]
