@@ -11,6 +11,7 @@ import queue
 import re
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 
@@ -24,6 +25,8 @@ from pynput import keyboard
 import Quartz
 from AppKit import NSWorkspace
 import webwindow
+import hud
+import statuspanel
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
@@ -33,7 +36,8 @@ HOTKEY = keyboard.Key.alt_r  # правый Option
 SAMPLE_RATE = 16000
 MIN_DURATION = 0.4  # сек; короче — случайное нажатие, игнорируем
 
-STATE = {"loading": True, "mic": "…", "enhance": True, "app": ""}
+STATE = {"loading": True, "mic": "…", "enhance": True, "app": "",
+         "perms": {}, "last_hotkey": 0.0, "started": time.time()}
 
 ROLES = {  # роль -> (заголовок раздела, [(HF-репозиторий, ~полный размер МБ, подпись)])
     "asr": ("Распознавание", [
@@ -74,7 +78,8 @@ STYLES = {  # ключ -> подпись в меню
 }
 CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "translate_all": False, "vp_threshold": 0.40,
-          "asr_model": ASR_MODEL, "llm_model": LLM_MODEL}
+          "asr_model": ASR_MODEL, "llm_model": LLM_MODEL,
+          **hud.DEFAULTS}  # индикатор записи и звуки
 
 
 def load_config():
@@ -86,6 +91,7 @@ def load_config():
         pass
     ASR_MODEL = CONFIG["asr_model"]
     LLM_MODEL = CONFIG["llm_model"]
+    hud.configure(CONFIG)
 
 
 def save_config():
@@ -465,6 +471,7 @@ def audio_callback(indata, frames, t, status):
         if recording:
             chunks.append(indata.copy())
             rec_frames[0] += len(indata)
+            hud.push_level(float(np.sqrt((indata ** 2).mean())))
             overflow = rec_frames[0] > MAX_REC_SEC * SAMPLE_RATE
     if overflow and recording:
         print(f"  ⏱ запись дольше {MAX_REC_SEC // 60} мин — авто-стоп и обработка", flush=True)
@@ -664,115 +671,122 @@ def ml_worker(ready: threading.Event):
             voiceprint = nonlocal_vp
             print("Отпечаток голоса сохранён.", flush=True)
             continue
-        duration = len(audio) / SAMPLE_RATE
-        rms = float(np.sqrt((audio ** 2).mean()))
-        if rms < 1e-4:
-            print("  ✗ запись тихая (AirPods в кейсе? крышка закрыта?) — "
-                  "ищу живой микрофон, попробуй ещё раз", flush=True)
-            try:
-                reopen_stream()
-            except Exception as e:
-                print(f"  не удалось переоткрыть: {e}", flush=True)
-            continue
-        # диагностика: цифровые нули в начале = устройство ещё не отдавало звук
-        nz = np.flatnonzero(audio)
-        if len(nz) and nz[0] > SAMPLE_RATE * 0.25:
-            print(f"  ⚠ микрофон молчал первые {nz[0] / SAMPLE_RATE:.2f}с записи "
-                  f"(просыпался после переключения?)", flush=True)
-        # VAD: есть ли вообще речь, и если есть — обрезать тишину по краям
-        spans = get_speech_timestamps(torch.from_numpy(audio), vad,
-                                      sampling_rate=SAMPLE_RATE, speech_pad_ms=150,
-                                      threshold=0.35)
-        if not spans:
+        ok = False
+        try:
+            duration = len(audio) / SAMPLE_RATE
             rms = float(np.sqrt((audio ** 2).mean()))
-            peak = float(np.abs(audio).max())
-            hint = ("захват почти пустой — микрофон не тот/тихий, "
-                    if peak < 0.02 else "сигнал есть, но VAD не распознал речь, ")
-            print(f"  ✗ речи не слышно ({hint}RMS={rms:.4f} peak={peak:.3f}) — "
-                  f"не вставляю", flush=True)
-            continue
-        audio = audio[max(0, spans[0]["start"] - SAMPLE_RATE // 4):
-                      spans[-1]["end"] + SAMPLE_RATE // 10]
-        # отпечаток голоса: чужую речь (ТВ, коллеги) не транскрибируем
-        if CONFIG["only_my_voice"] and voiceprint is not None:
-            sim = float(embed(audio) @ voiceprint)
-            if sim < CONFIG["vp_threshold"]:
-                print(f"  ✗ не твой голос (сходство {sim:.2f} < "
-                      f"{CONFIG['vp_threshold']}) — не вставляю", flush=True)
+            if rms < 1e-4:
+                print("  ✗ запись тихая (AirPods в кейсе? крышка закрыта?) — "
+                      "ищу живой микрофон, попробуй ещё раз", flush=True)
+                try:
+                    reopen_stream()
+                except Exception as e:
+                    print(f"  не удалось переоткрыть: {e}", flush=True)
                 continue
-        t0 = time.time()
-        try:
-            result = mlx_whisper.transcribe(
-                audio, path_or_hf_repo=ASR_MODEL, language=LANGUAGE,
-                initial_prompt=asr_hint() or None, word_timestamps=True)
-            raw = result["text"].strip()
-        except Exception as e:
-            print(f"  ошибка распознавания: {e}", flush=True)
-            continue
-        # слова, в которых Whisper сам не уверен, — кандидаты на ослышку.
-        # Первое слово, короткие и частые слова не считаем: у них низкая
-        # вероятность в норме, а «ремонт» по ним переписывает смысл
-        all_words = [w for s in result["segments"] for w in s.get("words", [])]
-        doubtful = []
-        for i, w in enumerate(all_words):
-            word = w["word"].strip()
-            core = re.sub(r"[^\wёЁ-]", "", word)
-            if (w["probability"] < 0.6 and i > 0 and len(core) >= 4
-                    and core.lower() not in STOP_DOUBT
-                    and not re.search(r"\d", core)):  # числа не «чиним»
-                doubtful.append(word)
-        t_asr = time.time() - t0
-        if not raw:
-            continue
-        # тихое аудио + initial_prompt => Whisper галлюцинирует куски словаря
-        raw_words = set(re.findall(r"\w+", raw.lower()))
-        hint_words = set(re.findall(r"\w+", asr_hint().lower()))
-        if raw_words and raw_words <= hint_words:
-            print(f"  ✗ похоже на эхо словаря, не вставляю: {raw}", flush=True)
-            continue
-        app = frontmost_app()
-        style = style_for(app)
-        text = raw
-        t_llm = 0.0
-        last_stats.clear()  # сбрасываем перед возможным запуском LLM
-        t1 = time.time()
-        try:
-            if style == "translate":
-                text = llm_run(TRANSLATE_PROMPT, raw, max_factor=3) or raw
-            elif style == "formal":
-                text = enhance(raw, formal=True, doubtful=doubtful)
-            elif style == "raw":
-                pass
-            elif STATE["enhance"] and (needs_enhance(raw) or doubtful):  # clean / casual
-                text = enhance(raw, doubtful=doubtful)
-                terms_lower = {t.strip().lower() for t in load_terms().split(",")}
-                guarded = guard_correction(raw, text, terms_lower)
-                if guarded != text:
-                    print(f"  ⛔ пост-контроль откатил часть правок LLM", flush=True)
-                    text = guarded
-        except Exception as e:
-            print(f"  ошибка обработки (вставляю сырой): {e}", flush=True)
-        t_llm = time.time() - t1
-        if style == "casual":
-            text = text.rstrip(".")
-        else:
-            text = strip_short_period(text)
-        paste_text(text)
-        gen_tps = last_stats.get("gen_tps")
-        gen_tokens = last_stats.get("gen_tokens")
-        db.execute(
-            "INSERT INTO transcriptions (ts, text, raw_text, duration, app, "
-            "style, asr_ms, llm_ms, gen_tps, gen_tokens) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (time.time(), text, raw, duration, app, style,
-             round(t_asr * 1000), round(t_llm * 1000), gen_tps, gen_tokens))
-        db.commit()
-        mark = "" if text == strip_short_period(raw) else f"  (сырой: {raw})"
-        doubt = f"  [сомнения: {', '.join(doubtful[:5])}]" if doubtful else ""
-        speed = f" @{gen_tps:.0f}т/с" if gen_tps else ""
-        rtf = duration / t_asr if t_asr else 0
-        print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
-              f"llm {t_llm:.1f}s{speed} → {app}/{style}] {text}{mark}{doubt}", flush=True)
+            # диагностика: цифровые нули в начале = устройство ещё не отдавало звук
+            nz = np.flatnonzero(audio)
+            if len(nz) and nz[0] > SAMPLE_RATE * 0.25:
+                print(f"  ⚠ микрофон молчал первые {nz[0] / SAMPLE_RATE:.2f}с записи "
+                      f"(просыпался после переключения?)", flush=True)
+            # VAD: есть ли вообще речь, и если есть — обрезать тишину по краям
+            spans = get_speech_timestamps(torch.from_numpy(audio), vad,
+                                          sampling_rate=SAMPLE_RATE, speech_pad_ms=150,
+                                          threshold=0.35)
+            if not spans:
+                rms = float(np.sqrt((audio ** 2).mean()))
+                peak = float(np.abs(audio).max())
+                hint = ("захват почти пустой — микрофон не тот/тихий, "
+                        if peak < 0.02 else "сигнал есть, но VAD не распознал речь, ")
+                print(f"  ✗ речи не слышно ({hint}RMS={rms:.4f} peak={peak:.3f}) — "
+                      f"не вставляю", flush=True)
+                continue
+            audio = audio[max(0, spans[0]["start"] - SAMPLE_RATE // 4):
+                          spans[-1]["end"] + SAMPLE_RATE // 10]
+            # отпечаток голоса: чужую речь (ТВ, коллеги) не транскрибируем
+            if CONFIG["only_my_voice"] and voiceprint is not None:
+                sim = float(embed(audio) @ voiceprint)
+                if sim < CONFIG["vp_threshold"]:
+                    print(f"  ✗ не твой голос (сходство {sim:.2f} < "
+                          f"{CONFIG['vp_threshold']}) — не вставляю", flush=True)
+                    continue
+            t0 = time.time()
+            try:
+                result = mlx_whisper.transcribe(
+                    audio, path_or_hf_repo=ASR_MODEL, language=LANGUAGE,
+                    initial_prompt=asr_hint() or None, word_timestamps=True)
+                raw = result["text"].strip()
+            except Exception as e:
+                print(f"  ошибка распознавания: {e}", flush=True)
+                continue
+            # слова, в которых Whisper сам не уверен, — кандидаты на ослышку.
+            # Первое слово, короткие и частые слова не считаем: у них низкая
+            # вероятность в норме, а «ремонт» по ним переписывает смысл
+            all_words = [w for s in result["segments"] for w in s.get("words", [])]
+            doubtful = []
+            for i, w in enumerate(all_words):
+                word = w["word"].strip()
+                core = re.sub(r"[^\wёЁ-]", "", word)
+                if (w["probability"] < 0.6 and i > 0 and len(core) >= 4
+                        and core.lower() not in STOP_DOUBT
+                        and not re.search(r"\d", core)):  # числа не «чиним»
+                    doubtful.append(word)
+            t_asr = time.time() - t0
+            if not raw:
+                continue
+            # тихое аудио + initial_prompt => Whisper галлюцинирует куски словаря
+            raw_words = set(re.findall(r"\w+", raw.lower()))
+            hint_words = set(re.findall(r"\w+", asr_hint().lower()))
+            if raw_words and raw_words <= hint_words:
+                print(f"  ✗ похоже на эхо словаря, не вставляю: {raw}", flush=True)
+                continue
+            app = frontmost_app()
+            style = style_for(app)
+            text = raw
+            t_llm = 0.0
+            last_stats.clear()  # сбрасываем перед возможным запуском LLM
+            t1 = time.time()
+            try:
+                if style == "translate":
+                    text = llm_run(TRANSLATE_PROMPT, raw, max_factor=3) or raw
+                elif style == "formal":
+                    text = enhance(raw, formal=True, doubtful=doubtful)
+                elif style == "raw":
+                    pass
+                elif STATE["enhance"] and (needs_enhance(raw) or doubtful):  # clean / casual
+                    text = enhance(raw, doubtful=doubtful)
+                    terms_lower = {t.strip().lower() for t in load_terms().split(",")}
+                    guarded = guard_correction(raw, text, terms_lower)
+                    if guarded != text:
+                        print(f"  ⛔ пост-контроль откатил часть правок LLM", flush=True)
+                        text = guarded
+            except Exception as e:
+                print(f"  ошибка обработки (вставляю сырой): {e}", flush=True)
+            t_llm = time.time() - t1
+            if style == "casual":
+                text = text.rstrip(".")
+            else:
+                text = strip_short_period(text)
+            paste_text(text)
+            ok = True
+            gen_tps = last_stats.get("gen_tps")
+            gen_tokens = last_stats.get("gen_tokens")
+            db.execute(
+                "INSERT INTO transcriptions (ts, text, raw_text, duration, app, "
+                "style, asr_ms, llm_ms, gen_tps, gen_tokens) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), text, raw, duration, app, style,
+                 round(t_asr * 1000), round(t_llm * 1000), gen_tps, gen_tokens))
+            db.commit()
+            mark = "" if text == strip_short_period(raw) else f"  (сырой: {raw})"
+            doubt = f"  [сомнения: {', '.join(doubtful[:5])}]" if doubtful else ""
+            speed = f" @{gen_tps:.0f}т/с" if gen_tps else ""
+            rtf = duration / t_asr if t_asr else 0
+            print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
+                  f"llm {t_llm:.1f}s{speed} → {app}/{style}] {text}{mark}{doubt}", flush=True)
+        finally:
+            # обратная связь: капсула прячется, звук — вставили или отбросили
+            hud.hide()
+            hud.play("done" if ok else "error")
 
 
 TAP_MAX = 0.35  # сек: короче — «тап» (toggle-режим), дольше — классический push-to-talk
@@ -803,11 +817,15 @@ def stop_and_submit():
     toggle_mode = False
     with lock:
         if not chunks:
+            hud.hide()
             return
         audio = np.concatenate(chunks).flatten().astype(np.float32)
         chunks.clear()
     if len(audio) / SAMPLE_RATE >= MIN_DURATION:
+        hud.show("busy")  # капсула: «распознаю…» до вставки/отказа
         jobs.put(("dictate", audio))
+    else:
+        hud.hide()
 
 
 def cancel_recording():
@@ -816,6 +834,7 @@ def cancel_recording():
     toggle_mode = False
     with lock:
         chunks.clear()
+    hud.hide()
     print("  ✗ запись отменена (Esc)", flush=True)
 
 
@@ -843,7 +862,10 @@ def on_press(key):
                 if got >= need:
                     break
         press_time = time.time()
+        STATE["last_hotkey"] = press_time
         recording = True
+        hud.play("start")
+        hud.show("rec")
         print("● запись...", flush=True)
     elif toggle_mode:
         stop_and_submit()  # второй тап — стоп
@@ -890,13 +912,19 @@ class DictateApp(rumps.App):
         self.vp_item.state = int(CONFIG["only_my_voice"])
 
         self.models_menu = rumps.MenuItem("Модели")
+        self.status_item = rumps.MenuItem("Состояние и разрешения…", callback=self.open_status)
+        self.hud_menu = self._build_hud_menu()
+        self.sounds_item = rumps.MenuItem("Звуки (старт / вставлено / отброшено)",
+                                          callback=self.toggle_sounds)
+        self.sounds_item.state = int(CONFIG["sounds"])
 
-        self.menu = [self.mic_item, self.recent, None,
+        self.menu = [self.status_item, self.mic_item, self.recent, None,
                      self.profile, self.default_style, self.translate_item, None,
                      self.vp_item,
                      rumps.MenuItem("Записать отпечаток голоса (5 с)", callback=self.enroll),
                      None,
                      self.enh_item,
+                     self.hud_menu, self.sounds_item,
                      self.models_menu,
                      rumps.MenuItem("Статистика…", callback=self.open_stats),
                      rumps.MenuItem("Поиск истории…", callback=self.open_search),
@@ -907,6 +935,177 @@ class DictateApp(rumps.App):
         rumps.Timer(self.refresh_recent, 3.0).start()
         self.refresh_models(None)
         rumps.Timer(self.refresh_models, 5.0).start()
+        rumps.Timer(self.refresh_status, 1.0).start()
+        self._version = app_version()
+        if STATE.get("show_status_on_start"):
+            # первый запуск / нет разрешений / модели ещё качаются — открываем окно
+            # состояния, когда NSApp уже крутит цикл (не из __init__)
+            self._boot = rumps.Timer(self._boot_show_status, 1.5)
+            self._boot.start()
+
+    def _boot_show_status(self, _):
+        self._boot.stop()
+        self.open_status(None)
+
+    # --- индикатор записи и звуки -------------------------------------------
+    def _build_hud_menu(self):
+        m = rumps.MenuItem("Индикатор записи")
+        self.hud_on = rumps.MenuItem("Показывать капсулу", callback=self.toggle_hud)
+        m.add(self.hud_on)
+        m.add(rumps.MenuItem("Показать пример (2 с)", callback=lambda _: hud.preview()))
+        m.add(None)
+        self.hud_groups = {}
+        groups = [("hud_size", "Размер", {k: v[0] for k, v in hud.SIZES.items()}),
+                  ("hud_color", "Цвет", {k: v[0] for k, v in hud.COLORS.items()}),
+                  ("hud_bg", "Фон", hud.BACKGROUNDS),
+                  ("hud_pos", "Положение", hud.POSITIONS)]
+        for key, title, options in groups:
+            sub = rumps.MenuItem(title)
+            for k, label in options.items():
+                it = rumps.MenuItem(label, callback=self.set_hud_opt)
+                it._opt = (key, k)
+                sub.add(it)
+            self.hud_groups[key] = sub
+            m.add(sub)
+        self._sync_hud_menu()
+        return m
+
+    def _sync_hud_menu(self):
+        self.hud_on.state = int(CONFIG["hud"])
+        for key, sub in self.hud_groups.items():
+            for it in sub.values():
+                it.state = int(it._opt[1] == CONFIG[key])
+
+    def toggle_hud(self, sender):
+        CONFIG["hud"] = not CONFIG["hud"]
+        save_config()
+        hud.configure(CONFIG)
+        self._sync_hud_menu()
+
+    def set_hud_opt(self, sender):
+        key, val = sender._opt
+        CONFIG[key] = val
+        save_config()
+        hud.configure(CONFIG)
+        self._sync_hud_menu()
+        hud.preview(1.5)
+
+    def toggle_sounds(self, sender):
+        CONFIG["sounds"] = not CONFIG["sounds"]
+        sender.state = int(CONFIG["sounds"])
+        save_config()
+        hud.configure(CONFIG)
+        if CONFIG["sounds"]:
+            hud.play("done")
+
+    # --- окно состояния -------------------------------------------------------
+    def open_status(self, _):
+        statuspanel.show(self.status_snapshot, {
+            "restart": restart_app,
+            "log": lambda: self.open_log(None),
+            "reopen": lambda: threading.Thread(target=reopen_stream, daemon=True).start(),
+            "reveal": reveal_binary,
+            "cache": lambda: subprocess.run(["open", os.path.dirname(_repo_dir("x/y"))]),
+            "perm:Микрофон": lambda: request_permission("Микрофон"),
+            "perm:Мониторинг ввода": lambda: request_permission("Мониторинг ввода"),
+            "perm:Универсальный доступ": lambda: request_permission("Универсальный доступ"),
+            "dl:asr": lambda: self._download_role("asr"),
+            "dl:llm": lambda: self._download_role("llm"),
+            "dir:asr": lambda: subprocess.run(["open", _repo_dir(CONFIG["asr_model"])]),
+            "dir:llm": lambda: subprocess.run(["open", _repo_dir(CONFIG["llm_model"])]),
+            "hud_test": lambda: hud.preview(2.5),
+        })
+
+    def _download_role(self, role):
+        repo = CONFIG[ROLE_CFG[role]]
+        it = rumps.MenuItem(repo)
+        it._repo = repo
+        self.download_model(it)
+
+    def refresh_status(self, _):
+        # окно закрыто — снимок не собираем (в нём вызовы TCC/PortAudio)
+        if statuspanel.is_visible():
+            statuspanel.refresh()
+        issues = any(v != "ok" for v in STATE["perms"].values())
+        self.status_item.title = ("⚠️ Состояние и разрешения…" if issues
+                                  else "Состояние и разрешения…")
+
+    def status_snapshot(self):
+        perms = perm_status()
+        # --- служба ---
+        if STATE["loading"]:
+            svc = ("⏳ Модели загружаются в память (после старта ~20–30 с, при первом "
+                   "запуске — скачиваются)")
+        elif recording:
+            svc = "🔴 Идёт запись"
+        elif stream_alive():
+            svc = "✅ Готов: зажми правый Option и говори"
+        elif "нет" in STATE["mic"]:
+            svc = "⚠️ Нет ни одного микрофона — подключи AirPods или USB-микрофон"
+        else:
+            svc = "⚠️ Аудиопоток не отдаёт данные — переоткрываю…"
+        up = int(time.time() - STATE["started"])
+        upt = f"{up // 3600} ч {up % 3600 // 60} мин" if up >= 3600 else f"{up // 60} мин {up % 60} с"
+        plist = os.path.expanduser("~/Library/LaunchAgents/com.kkd.dictate.plist")
+        how = "демон launchd (com.kkd.dictate, автозапуск при входе)" if os.path.exists(plist) \
+            else "вручную (без демона — после выхода не поднимется сам)"
+        service = [
+            ("Состояние", svc, "Перезапустить", "restart"),
+            ("Процесс", f"PID {os.getpid()} · работает {upt} · версия {self._version} · {how}",
+             "Лог…", "log"),
+        ]
+        # --- разрешения ---
+        icons = {"ok": "✅ выдано", "ask": "❔ ещё не спрашивали — нажми «Запросить»",
+                 "denied": "❌ нет — включи галку в Настройках для процесса ниже"}
+        prows = []
+        for name in PRIVACY_PANES:
+            st = perms[name]
+            btn = None if st == "ok" else ("Запросить" if st == "ask" else "Открыть Настройки")
+            prows.append((name, f"{icons[st]} · нужно, чтобы {PERM_WHY[name]}", btn, f"perm:{name}"))
+        binary = os.path.realpath(sys.executable)
+        prows.append(("Кому выдавать", f"{binary}\nПосле включения галки нажми «Перезапустить» "
+                      "— macOS применяет разрешения к новому процессу.", "Показать в Finder", "reveal"))
+        # --- микрофон ---
+        devs = input_devices()
+        mic = [
+            ("Пишем с", STATE["mic"], "Переоткрыть поток", "reopen"),
+            ("Входы в системе", ", ".join(devs) if devs else "нет ни одного входного устройства",
+             None, None),
+        ]
+        # --- модели ---
+        mrows = []
+        for role, (title, options) in ROLES.items():
+            repo = CONFIG[ROLE_CFG[role]]
+            full = next((f for r, f, _ in options if r == repo), 0)
+            label = next((l for r, _, l in options if r == repo), repo)
+            st = _repo_status(repo, full)
+            if st["state"] == "done":
+                txt, btn, act = f"● скачана · {_fmt_mb(st['mb'])} · {label}", "Папка", f"dir:{role}"
+            elif st["state"] == "loading":
+                txt, btn, act = (f"⏳ скачивается: {_fmt_mb(st['mb'])} из ~{_fmt_mb(full)} · {label}",
+                                 None, None)
+            else:
+                txt, btn, act = (f"○ не скачана (~{_fmt_mb(full)}) · {label} — скачается при "
+                                 f"первом запуске или по кнопке", "Скачать", f"dl:{role}")
+            mrows.append((title, f"{repo.split('/')[-1]}\n{txt}", btn, act))
+        ec = _repo_status("speechbrain/spkrec-ecapa-voxceleb", 90)
+        ec_txt = ("● " + _fmt_mb(ec["mb"]) if ec["state"] == "done"
+                  else "⏳ скачивается" if ec["state"] == "loading" else "○ не скачан (~90 МБ)")
+        vad_txt = "● загружен" if not STATE["loading"] else "⏳"
+        mrows.append(("Служебные", f"Отпечаток голоса ECAPA: {ec_txt} · Silero VAD: {vad_txt}",
+                      "Открыть кэш", "cache"))
+        # --- хоткей ---
+        last = STATE["last_hotkey"]
+        if last:
+            ago = int(time.time() - last)
+            hk = f"✅ обнаружен {ago} с назад" if ago < 3600 else "✅ обнаружен (давно)"
+        elif perms["Мониторинг ввода"] != "ok":
+            hk = "⏸ ждёт разрешения «Мониторинг ввода»"
+        else:
+            hk = "нажми правый Option — здесь появится ✅"
+        hot = [("Правый Option", hk, "Проверить индикатор", "hud_test")]
+        return [("Служба", service), ("Разрешения", prows), ("Микрофон", mic),
+                ("Модели", mrows), ("Хоткей и индикатор", hot)]
 
     def refresh_models(self, _):
         try:
@@ -1129,6 +1328,66 @@ PRIVACY_PANES = {  # разрешение -> раздел Настроек
     "Мониторинг ввода": "Privacy_ListenEvent",
     "Универсальный доступ": "Privacy_Accessibility",
 }
+PERM_WHY = {
+    "Микрофон": "записывать голос во время диктовки",
+    "Мониторинг ввода": "видеть глобальный хоткей (правый Option)",
+    "Универсальный доступ": "вставлять текст (⌘V) и находить курсор для индикатора",
+}
+
+
+def _iokit():
+    import ctypes
+    return ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+
+
+def perm_status() -> dict:
+    """{имя: 'ok' | 'ask' | 'denied'} — ask = система ещё покажет диалог."""
+    from ApplicationServices import AXIsProcessTrusted
+    from AVFoundation import AVCaptureDevice
+    mic = AVCaptureDevice.authorizationStatusForMediaType_("soun")  # 0 не опр., 3 ок
+    hid = _iokit().IOHIDCheckAccess(1)  # 0 ок, 1 отказ, 2 не определено
+    st = {
+        "Микрофон": "ok" if mic == 3 else "ask" if mic == 0 else "denied",
+        "Мониторинг ввода": "ok" if hid == 0 else "ask" if hid == 2 else "denied",
+        "Универсальный доступ": "ok" if AXIsProcessTrusted() else "denied",
+    }
+    STATE["perms"] = st
+    return st
+
+
+def open_privacy_pane(name: str):
+    subprocess.run(["open", "x-apple.systempreferences:com.apple.preference."
+                    f"security?{PRIVACY_PANES[name]}"])
+
+
+def reveal_binary():
+    subprocess.run(["open", "-R", os.path.realpath(sys.executable)])
+
+
+def request_permission(name: str, quiet=False):
+    """Запросить одно разрешение: системный диалог, если он ещё возможен,
+    иначе — открыть панель Настроек (и показать бинарник в Finder)."""
+    from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
+    from AVFoundation import AVCaptureDevice
+    st = perm_status().get(name)
+    if st == "ok":
+        return
+    if name == "Микрофон":
+        if st == "ask":
+            AVCaptureDevice.requestAccessForMediaType_completionHandler_("soun", lambda ok: None)
+            return
+    elif name == "Мониторинг ввода":
+        if st == "ask":
+            _iokit().IOHIDRequestAccess(1)
+            return
+    elif name == "Универсальный доступ":
+        # диалог со ссылкой в Настройки система показывает только в первый раз
+        if AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}):
+            return
+    # диалога уже не будет — ведём пользователя в Настройки
+    if not quiet:
+        reveal_binary()
+    open_privacy_pane(name)
 
 
 def request_permissions():
@@ -1137,45 +1396,53 @@ def request_permissions():
     Системный диалог macOS показывает только в статусе «не определён»; после
     отказа молча отказывает — тогда открываем нужную панель Настроек сами и
     показываем в Finder бинарник, который надо добавить в список."""
-    import sys
-    import ctypes
-    from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
-    from AVFoundation import AVCaptureDevice
-    missing, denied = [], []
-    # Микрофон: 0 = не определён (запрос покажет диалог), 3 = выдано
-    mic = AVCaptureDevice.authorizationStatusForMediaType_("soun")
-    if mic != 3:
-        AVCaptureDevice.requestAccessForMediaType_completionHandler_("soun", lambda ok: None)
-        missing.append("Микрофон")
-        if mic != 0:
-            denied.append("Микрофон")
-    # Мониторинг ввода: 0 = выдано, 1 = отказано, 2 = не определён (запрос покажет диалог)
-    iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
-    hid = iokit.IOHIDCheckAccess(1)
-    if hid != 0:
-        iokit.IOHIDRequestAccess(1)
-        missing.append("Мониторинг ввода")
-        if hid == 1:
-            denied.append("Мониторинг ввода")
-    # Универсальный доступ: диалог со ссылкой в настройки (только при первом разе)
-    if not AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}):
-        missing.append("Универсальный доступ")
-        denied.append("Универсальный доступ")  # повторного диалога не будет
+    st = perm_status()
+    missing = [n for n, v in st.items() if v != "ok"]
     if not missing:
         print("Разрешения: все выданы.", flush=True)
-        return
+        return []
     binary = os.path.realpath(sys.executable)
     print(f"⚠ Нет разрешений: {', '.join(missing)}. Процесс, которому надо их "
           f"выдать: {binary}", flush=True)
+    denied = [n for n in missing if st[n] == "denied"]
+    for n in missing:
+        if st[n] == "ask" or n == "Универсальный доступ":
+            request_permission(n, quiet=True)  # системные диалоги
     if denied:
-        # диалогов не будет — ведём пользователя: Finder с бинарником (перетащи
-        # его в список «+») и панель Настроек первого недостающего разрешения
         print(f"  Диалог система уже не покажет ({', '.join(denied)}) — открываю "
               f"Настройки и Finder. Добавь бинарник в список (перетаскиванием), "
-              f"включи галку и сделай daemon.sh restart.", flush=True)
-        subprocess.run(["open", "-R", binary])
-        subprocess.run(["open", "x-apple.systempreferences:com.apple.preference."
-                        f"security?{PRIVACY_PANES[denied[0]]}"])
+              f"включи галку и нажми «Перезапустить» в окне состояния.", flush=True)
+        reveal_binary()
+        open_privacy_pane(denied[0])
+    return missing
+
+
+def input_devices() -> list:
+    """Имена входных устройств, видимых PortAudio (без переинициализации)."""
+    try:
+        return [d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0]
+    except Exception:
+        return []
+
+
+def restart_app():
+    """Перезапуск процесса: через launchd, если стоим демоном, иначе exec."""
+    label = "com.kkd.dictate"
+    plist = os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
+    print("Перезапуск по запросу из окна состояния…", flush=True)
+    if os.path.exists(plist):
+        r = subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"])
+        if r.returncode == 0:
+            return  # нас уже убивают
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def app_version() -> str:
+    try:
+        return subprocess.run(["git", "-C", BASE, "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=3).stdout.strip() or "?"
+    except Exception:
+        return "?"
 
 
 def _choose_model_dialog(role: str) -> str | None:
@@ -1228,8 +1495,11 @@ def ask_first_download():
 
 def main():
     load_config()
-    request_permissions()
+    missing = request_permissions()
     ask_first_download()
+    # окно состояния при старте: нет разрешений или активные модели ещё не на диске
+    need_dl = any(_repo_status(CONFIG[ROLE_CFG[r]], 0)["state"] != "done" for r in ROLES)
+    STATE["show_status_on_start"] = bool(missing) or need_dl
     print(f"Прогреваю модели ({ASR_MODEL.split('/')[-1]} + {LLM_MODEL.split('/')[-1]})...")
     ready = threading.Event()
     threading.Thread(target=ml_worker, args=(ready,), daemon=True).start()
