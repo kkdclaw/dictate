@@ -36,7 +36,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -76,7 +76,11 @@ ROLES = {  # роль -> (заголовок раздела, [(HF-репозит
 ROLE_CFG = {"asr": "asr_model", "llm": "llm_model"}  # роль -> ключ в config.json
 
 CONFIG_PATH = os.path.join(BASE, "config.json")
-VOICEPRINT_PATH = os.path.join(BASE, "voiceprint.npy")
+VOICEPRINT_PATH = os.path.join(BASE, "voiceprint.npz")
+VOICEPRINT_OLD = os.path.join(BASE, "voiceprint.npy")  # формат до 0.5.0: только вектор
+VP_RECORD_SEC = 12   # столько пишем при записи отпечатка
+VP_CHECK_SEC = 4     # столько пишем при проверке «мой ли голос»
+VP_MIN_SPEECH = 4.0  # минимум чистой речи (после VAD) для годного отпечатка
 STYLES = {  # ключ -> подпись в меню
     "clean": "Чистка (по умолчанию)",
     "casual": "Разговорный (без точек)",
@@ -88,6 +92,45 @@ CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "translate_all": False, "vp_threshold": 0.40, "enhance": True,
           "asr_model": ASR_MODEL, "llm_model": LLM_MODEL,
           **hud.DEFAULTS}  # индикатор записи и звуки
+
+
+def notify_ui(title: str, message: str):
+    """Показать окно с результатом из любого потока (ML-поток — не главный)."""
+    from PyObjCTools import AppHelper
+    AppHelper.callAfter(lambda: rumps.alert(title, message))
+
+
+def load_voiceprint():
+    """Отпечаток с диска: dict с вектором и данными записи, или None.
+
+    Старый формат (.npy, один вектор без метаданных) читаем как есть — иначе
+    после обновления у людей молча пропадал бы записанный отпечаток."""
+    try:
+        if os.path.exists(VOICEPRINT_PATH):
+            d = np.load(VOICEPRINT_PATH, allow_pickle=False)
+            return {"vec": d["vec"], "ts": float(d["ts"]), "device": str(d["device"]),
+                    "windows": int(d["windows"]), "speech_sec": float(d["speech_sec"]),
+                    "self_min": float(d["self_min"]), "self_mean": float(d["self_mean"])}
+        if os.path.exists(VOICEPRINT_OLD):
+            return {"vec": np.load(VOICEPRINT_OLD), "ts": os.path.getmtime(VOICEPRINT_OLD),
+                    "device": "?", "windows": 1, "speech_sec": 0.0,
+                    "self_min": 0.0, "self_mean": 0.0, "legacy": True}
+    except Exception as e:
+        print(f"  отпечаток голоса не прочитался ({e}) — запиши заново", flush=True)
+    return None
+
+
+def voiceprint_summary() -> str:
+    """Строка для меню и панели: когда и на каком микрофоне записан."""
+    vp = load_voiceprint()
+    if vp is None:
+        return "не записан"
+    when = time.strftime("%d.%m.%Y", time.localtime(vp["ts"]))
+    if vp.get("legacy"):
+        return f"{when}, старый формат — перезапиши"
+    warn = "" if vp["device"] == STATE.get("mic") else "  ⚠️ сейчас другой микрофон"
+    return (f"{when}, {vp['device']}, {vp['speech_sec']:.0f}с речи, "
+            f"порог {CONFIG['vp_threshold']}{warn}")
 
 
 def load_config():
@@ -632,13 +675,14 @@ def history_db() -> sqlite3.Connection:
     # метрики скорости — добавляем к существующей таблице, если их ещё нет
     have = {r[1] for r in db.execute("PRAGMA table_info(transcriptions)")}
     for col in ("style TEXT", "asr_ms REAL", "llm_ms REAL",
-                "gen_tps REAL", "gen_tokens INTEGER"):
+                "gen_tps REAL", "gen_tokens INTEGER", "vp_sim REAL"):
         if col.split()[0] not in have:
             db.execute(f"ALTER TABLE transcriptions ADD COLUMN {col}")
     return db
 
 
 MAX_REC_SEC = 600  # предохранитель: забытый toggle не пишет вечно — авто-стоп и обработка
+enroll_buf = {"on": False, "chunks": []}  # захват отпечатка/проверки голоса
 rec_frames = [0]  # счётчик сэмплов текущей записи (под lock)
 overflow_sent = [False]  # авто-стоп ставится один раз на запись, а не на каждый колбэк
 
@@ -648,6 +692,12 @@ def audio_callback(indata, frames, t, status):
     overflow = False
     with lock:
         preroll.append((now, indata.copy()))
+        if enroll_buf["on"]:
+            # отпечаток пишем ИЗ ЭТОГО ЖЕ потока, а не отдельным sd.rec: иначе
+            # запись шла с другого устройства, чем диктовка, и эмбеддинги
+            # разных микрофонов не сходились ни при каком пороге
+            enroll_buf["chunks"].append(indata.copy())
+            hud.push_level(float(np.sqrt((indata ** 2).mean())))
         if recording:
             chunks.append(indata.copy())
             rec_frames[0] += len(indata)
@@ -782,7 +832,8 @@ def ml_worker(ready: threading.Event):
         traceback.print_exc()
         ready.set()
         return
-    voiceprint = np.load(VOICEPRINT_PATH) if os.path.exists(VOICEPRINT_PATH) else None
+    _vp = load_voiceprint()
+    voiceprint = _vp["vec"] if _vp else None
     STATE["loading"] = False
     ready.set()
 
@@ -799,7 +850,61 @@ def ml_worker(ready: threading.Event):
 
     def embed(audio: np.ndarray) -> np.ndarray:
         e = spk.encode_batch(torch.from_numpy(audio).unsqueeze(0)).squeeze().numpy()
-        return e / np.linalg.norm(e)
+        n = np.linalg.norm(e)
+        if not np.isfinite(n) or n < 1e-9:  # тишина -> нули -> деление дало бы NaN
+            raise ValueError("пустой эмбеддинг (тишина?)")
+        return e / n
+
+    def speech_only(audio: np.ndarray) -> np.ndarray:
+        """Оставить только речь. Отпечаток и проверка ОБЯЗАНЫ идти через это:
+        при сравнении диктовка уже обрезана по VAD, и эмбеддинг «5 секунд, где
+        речи две» с ней не сходился — из-за этого «только мой голос» отсекал
+        собственного хозяина."""
+        spans = get_speech_timestamps(torch.from_numpy(audio), vad,
+                                      sampling_rate=SAMPLE_RATE, speech_pad_ms=150,
+                                      threshold=0.35)
+        if not spans:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate([audio[s["start"]:s["end"]] for s in spans])
+
+    def embed_windows(speech: np.ndarray) -> list:
+        """Эмбеддинги окон по 3 с с шагом 1.5 с — устойчивее одного снимка."""
+        win, hop = int(3 * SAMPLE_RATE), int(1.5 * SAMPLE_RATE)
+        if len(speech) <= win:
+            return [embed(speech)]
+        return [embed(speech[i:i + win])
+                for i in range(0, len(speech) - win + 1, hop)]
+
+    def make_voiceprint(audio: np.ndarray) -> dict:
+        """Отпечаток из записи: усреднённый эмбеддинг окон + разброс между ними.
+
+        Разброс — это «насколько мой голос похож сам на себя» в этих условиях;
+        по нему подбираем порог, а не берём константу с потолка."""
+        speech = speech_only(audio)
+        secs = len(speech) / SAMPLE_RATE
+        if secs < VP_MIN_SPEECH:
+            raise ValueError(f"речи всего {secs:.1f}с из нужных {VP_MIN_SPEECH:.0f}с — "
+                             "говори подряд, без длинных пауз")
+        embs = embed_windows(speech)
+        mean = np.mean(embs, axis=0)
+        mean /= np.linalg.norm(mean)
+        sims = [float(e @ mean) for e in embs]
+        low = min(sims)
+        # Порог. Окна одной записи похожи между собой куда сильнее, чем записи
+        # разных дней (другой микрофон, простуда, расстояние до рта), поэтому
+        # строже 0.40 не берём никогда — иначе назавтра фильтр отбросит хозяина.
+        # Разброс окон используем только чтобы ОСЛАБИТЬ порог, если запись вышла
+        # шумной. Замер на синтезированной речи: чужой голос даёт 0.04…0.11,
+        # запас до 0.40 огромный, а вот свой после смены микрофона проседает.
+        thr = round(min(0.40, max(0.28, low - 0.30)), 2)
+        return {"vec": mean, "speech_sec": secs, "windows": len(embs),
+                "self_min": low, "self_mean": float(np.mean(sims)),
+                "threshold": thr, "device": STATE["mic"], "ts": time.time()}
+
+    def save_voiceprint(vp: dict):
+        np.savez(VOICEPRINT_PATH, vec=vp["vec"], ts=vp["ts"], device=vp["device"],
+                 windows=vp["windows"], speech_sec=vp["speech_sec"],
+                 self_min=vp["self_min"], self_mean=vp["self_mean"])
 
     def llm_run(system: str, user: str, max_factor: int = 2) -> str:
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -864,16 +969,45 @@ def ml_worker(ready: threading.Event):
             continue
         if kind == "enroll":
             try:
-                nonlocal_vp = embed(payload)
-                if float(np.sqrt((payload ** 2).mean())) < 1e-4:
-                    print("  ✗ отпечаток не записан: было тихо, попробуй ещё раз",
-                          flush=True)
-                    continue
-                np.save(VOICEPRINT_PATH, nonlocal_vp)
-                voiceprint = nonlocal_vp
-                print("Отпечаток голоса сохранён.", flush=True)
+                vp = make_voiceprint(payload)
+                save_voiceprint(vp)
+                voiceprint = vp["vec"]
+                CONFIG["vp_threshold"] = vp["threshold"]  # порог от разброса, не с потолка
+                save_config()
+                msg = (f"Отпечаток записан: {vp['speech_sec']:.0f}с речи, "
+                       f"{vp['windows']} окон, микрофон «{vp['device']}».\n"
+                       f"Похожесть окон на себя: {vp['self_min']:.2f}…{vp['self_mean']:.2f}.\n"
+                       f"Порог подобран автоматически: {vp['threshold']}.")
+                print(f"Отпечаток голоса сохранён ({vp['speech_sec']:.0f}с речи, "
+                      f"окон {vp['windows']}, само-похожесть {vp['self_min']:.2f}…"
+                      f"{vp['self_mean']:.2f}, порог {vp['threshold']})", flush=True)
+                notify_ui("Отпечаток голоса записан", msg)
             except Exception as e:
                 print(f"  ✗ отпечаток не записан: {e}", flush=True)
+                notify_ui("Отпечаток не записан", f"{e}\n\nПопробуй ещё раз: говори "
+                          "непрерывно, обычным голосом, в тот же микрофон.")
+            continue
+        if kind == "vpcheck":
+            try:
+                if voiceprint is None:
+                    raise ValueError("отпечаток ещё не записан")
+                speech = speech_only(payload)
+                if len(speech) < 1.0 * SAMPLE_RATE:
+                    raise ValueError("речи не слышно — скажи фразу вслух")
+                sim = float(embed(speech) @ voiceprint)
+                thr = CONFIG["vp_threshold"]
+                verdict = ("✅ Узнаю — это твой голос" if sim >= thr else
+                           "❌ Не узнаю — такую диктовку я бы отбросил")
+                print(f"  проверка голоса: сходство {sim:.2f} при пороге {thr}", flush=True)
+                notify_ui("Проверка голоса",
+                          f"{verdict}\n\nСходство {sim:.2f}, порог {thr}.\n"
+                          f"Микрофон: {STATE['mic']}.\n\n"
+                          + ("Запас хороший." if sim >= thr + 0.1 else
+                             "Запас маленький: перезапиши отпечаток на этом микрофоне "
+                             "или сделай строгость мягче."))
+            except Exception as e:
+                print(f"  ✗ проверка голоса не вышла: {e}", flush=True)
+                notify_ui("Проверка голоса", f"Не получилось: {e}")
             continue
         audio, rec_app, token = payload
         ok = False
@@ -917,11 +1051,23 @@ def ml_worker(ready: threading.Event):
             audio = audio[max(0, spans[0]["start"] - SAMPLE_RATE // 4):
                           spans[-1]["end"] + SAMPLE_RATE // 10]
             # отпечаток голоса: чужую речь (ТВ, коллеги) не транскрибируем
+            vp_sim = None
             if CONFIG["only_my_voice"] and voiceprint is not None:
-                sim = float(embed(audio) @ voiceprint)
-                if sim < CONFIG["vp_threshold"]:
-                    print(f"  ✗ не твой голос (сходство {sim:.2f} < "
-                          f"{CONFIG['vp_threshold']}) — не вставляю", flush=True)
+                try:
+                    vp_sim = float(embed(audio) @ voiceprint)
+                except Exception as e:
+                    # сбой сравнения не повод терять диктовку — пропускаем дальше
+                    print(f"  ⚠ отпечаток не сравнился ({e}) — вставляю без проверки",
+                          flush=True)
+                if vp_sim is not None:
+                    STATE["vp_last"] = vp_sim  # видно в панели: есть ли запас до порога
+                if vp_sim is not None and vp_sim < CONFIG["vp_threshold"]:
+                    near = ("  Почти прошло — «Мой голос → Строгость» мягче или "
+                            "перезапиши отпечаток."
+                            if vp_sim > CONFIG["vp_threshold"] - 0.1 else "")
+                    print(f"  ✗ не твой голос (сходство {vp_sim:.2f} < "
+                          f"{CONFIG['vp_threshold']}) — не вставляю.{near}", flush=True)
+                    hud.play("error")
                     continue
             t0 = time.time()
             try:
@@ -990,17 +1136,20 @@ def ml_worker(ready: threading.Event):
             gen_tokens = last_stats.get("gen_tokens")
             db.execute(
                 "INSERT INTO transcriptions (ts, text, raw_text, duration, app, "
-                "style, asr_ms, llm_ms, gen_tps, gen_tokens) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "style, asr_ms, llm_ms, gen_tps, gen_tokens, vp_sim) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), text, raw, duration, app, style,
-                 round(t_asr * 1000), round(t_llm * 1000), gen_tps, gen_tokens))
+                 round(t_asr * 1000), round(t_llm * 1000), gen_tps, gen_tokens, vp_sim))
             db.commit()
             mark = "" if text == strip_short_period(raw) else f"  (сырой: {raw})"
             doubt = f"  [сомнения: {', '.join(doubtful[:5])}]" if doubtful else ""
             speed = f" @{gen_tps:.0f}т/с" if gen_tps else ""
+            # сходство печатаем и при успехе: иначе непонятно, есть ли запас до порога
+            vp = f" голос {vp_sim:.2f}" if vp_sim is not None else ""
             rtf = duration / t_asr if t_asr else 0
             print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
-                  f"llm {t_llm:.1f}s{speed} → {app}/{style}] {text}{mark}{doubt}", flush=True)
+                  f"llm {t_llm:.1f}s{speed}{vp} → {app}/{style}] {text}{mark}{doubt}",
+                  flush=True)
         except Exception as e:
             # любое необработанное исключение раньше убивало поток навсегда:
             # иконка «готов», хоткей пишет, а текст не вставляется никогда
@@ -1057,6 +1206,12 @@ def cancel_recording():
 
 def start_recording():
     global recording, press_time
+    if enroll_buf["on"]:
+        # идёт запись отпечатка/проверки: два захвата с одного потока перепутают
+        # звук между собой
+        print("  ⏸ сейчас пишется отпечаток голоса — договорим и диктуй", flush=True)
+        hud.play("error")
+        return
     if STATE["loading"]:
         # модели ещё греются: записанное всё равно вставится минут через
         # несколько и не туда — честно отказываем сразу
@@ -1152,8 +1307,7 @@ class DictateApp(rumps.App):
             self.default_style.add(it)
         self.translate_item = rumps.MenuItem("Перевод → EN (везде)", callback=self.toggle_translate)
         self.translate_item.state = int(CONFIG["translate_all"])
-        self.vp_item = rumps.MenuItem("Только мой голос", callback=self.toggle_voice)
-        self.vp_item.state = int(CONFIG["only_my_voice"])
+        self.voice_menu = self._build_voice_menu()
 
         self.models_menu = rumps.MenuItem("Модели")
         # версия в меню: видно без открытия панели, клик — копия для отчёта об ошибке
@@ -1164,8 +1318,7 @@ class DictateApp(rumps.App):
 
         self.menu = [self.status_item, self.perm_item, self.mic_item, self.recent, None,
                      self.profile, self.default_style, self.translate_item, None,
-                     self.vp_item,
-                     rumps.MenuItem("Записать отпечаток голоса (5 с)", callback=self.enroll),
+                     self.voice_menu,
                      None,
                      self.enh_item,
                      self.hud_menu,
@@ -1181,6 +1334,8 @@ class DictateApp(rumps.App):
         self.refresh_models(None)
         rumps.Timer(self.refresh_models, 5.0).start()
         rumps.Timer(self.refresh_status, 1.0).start()
+        self.refresh_voice_menu()
+        rumps.Timer(self.refresh_voice_menu, 3.0).start()
         self._version = app_version()
         if STATE.get("show_status_on_start"):
             # первый запуск / нет разрешений / модели ещё качаются — открываем окно
@@ -1191,6 +1346,31 @@ class DictateApp(rumps.App):
     def _boot_show_status(self, _):
         self._boot.stop()
         self.open_status(None, activate=False)  # при логине фокус не отбираем
+
+    # --- мой голос ------------------------------------------------------------
+    def _build_voice_menu(self):
+        """Всё про отпечаток в одном месте: состояние, запись, проверка, строгость."""
+        m = rumps.MenuItem("Мой голос")
+        self.vp_status = rumps.MenuItem("Отпечаток: …")  # без callback — просто строка
+        self.vp_item = rumps.MenuItem("Пропускать только мой голос",
+                                      callback=self.toggle_voice)
+        self.vp_check = rumps.MenuItem("Проверить: узнаю ли я тебя…")
+        m.add(self.vp_status)
+        m.add(rumps.separator)
+        m.add(self.vp_item)
+        m.add(rumps.MenuItem("Записать отпечаток заново…", callback=self.enroll))
+        m.add(self.vp_check)
+        strict = rumps.MenuItem("Строгость")
+        self.vp_strict = {}
+        for label, thr in [("Строго — чужих точно нет", 0.55),
+                           ("Обычно", 0.40),
+                           ("Мягко — лишь бы своё не терять", 0.28)]:
+            it = rumps.MenuItem(label, callback=self.set_vp_strictness)
+            it._thr = thr
+            strict.add(it)
+            self.vp_strict[label] = it
+        m.add(strict)
+        return m
 
     # --- индикатор записи и звуки -------------------------------------------
     def _build_hud_menu(self):
@@ -1277,6 +1457,8 @@ class DictateApp(rumps.App):
         statuspanel.show(self.status_snapshot, activate=activate, actions={
             "restart": restart_app,
             "copy_version": lambda: self.copy_version(None),
+            "vp_enroll": lambda: self.enroll(None),
+            "vp_check": lambda: self.vp_check_run(None),
             "log": lambda: self.open_log(None),
             "reopen": lambda: threading.Thread(target=reopen_stream, daemon=True).start(),
             "reveal": reveal_binary,
@@ -1428,8 +1610,24 @@ class DictateApp(rumps.App):
         snd = "выключены" if not CONFIG["sounds"] else hud.sound_route_info()
         hot = [("Правый Option", hk, "Проверить индикатор", "hud_test"),
                ("Звуки", snd, None, None)]
+        # --- мой голос ---
+        vp = load_voiceprint()
+        if not CONFIG["only_my_voice"]:
+            vtxt = ("фильтр выключен — вставляю любую речь"
+                    + ("" if vp is None else f" (отпечаток есть: {voiceprint_summary()})"))
+        elif vp is None:
+            vtxt = "⚠️ фильтр включён, но отпечатка нет — запиши, иначе он ничего не делает"
+        else:
+            vtxt = f"✅ пропускаю только мой голос · {voiceprint_summary()}"
+        vrows = [("Состояние", vtxt, "Записать заново", "vp_enroll")]
+        if vp is not None:
+            last = STATE.get("vp_last")
+            vrows.append(("Последнее сравнение",
+                          f"сходство {last:.2f} при пороге {CONFIG['vp_threshold']}"
+                          if last is not None else "ещё не сравнивал — продиктуй что-нибудь",
+                          "Проверить голос", "vp_check"))
         return [("Служба", service), ("Разрешения", prows), ("Микрофон", mic),
-                ("Модели", mrows), ("Хоткей и индикатор", hot)]
+                ("Мой голос", vrows), ("Модели", mrows), ("Хоткей и индикатор", hot)]
 
     def refresh_models(self, _):
         try:
@@ -1558,8 +1756,9 @@ class DictateApp(rumps.App):
 
     def refresh_title(self, _):
         # ❌ — модели не загрузились; ⚠️ — поток мёртв/переоткрывается
-        title = ("❌" if STATE["error"] else "⏳" if STATE["loading"]
-                 else "🟠" if recording else "🎙️" if stream_alive() else "⚠️")
+        title = (STATE.get("vp_countdown")  # запись отпечатка: обратный отсчёт в баре
+                 or ("❌" if STATE["error"] else "⏳" if STATE["loading"]
+                     else "🟠" if recording else "🎙️" if stream_alive() else "⚠️"))
         if title != self.title:
             self.title = title
         mic = f"Микрофон: {STATE['mic']}"
@@ -1598,27 +1797,89 @@ class DictateApp(rumps.App):
         save_config()
 
     def toggle_voice(self, sender):
-        if not os.path.exists(VOICEPRINT_PATH) and not CONFIG["only_my_voice"]:
+        if load_voiceprint() is None and not CONFIG["only_my_voice"]:
             rumps.alert("Только мой голос",
-                        "Сначала запиши отпечаток: пункт «Записать отпечаток голоса (5 с)».")
+                        "Сначала запиши отпечаток: «Мой голос → Записать отпечаток…».")
             return
         CONFIG["only_my_voice"] = not CONFIG["only_my_voice"]
         sender.state = int(CONFIG["only_my_voice"])
         save_config()
+        self.refresh_voice_menu()
+
+    def set_vp_strictness(self, sender):
+        CONFIG["vp_threshold"] = sender._thr
+        save_config()
+        self.refresh_voice_menu()
+
+    def refresh_voice_menu(self, _=None):
+        """Подписи пункта «Мой голос»: состояние видно, не открывая панель."""
+        self.vp_status.title = f"Отпечаток: {voiceprint_summary()}"
+        have = load_voiceprint() is not None
+        self.vp_item.state = int(CONFIG["only_my_voice"] and have)
+        self.vp_check.set_callback(self.vp_check_run if have else None)
+        for it in self.vp_strict.values():
+            it.state = int(abs(CONFIG["vp_threshold"] - it._thr) < 0.005)
+
+    def _capture(self, kind, seconds, title, body):
+        """Записать кусок с ОСНОВНОГО потока (тот же микрофон, что у диктовки),
+        показывая капсулу с уровнем, и отдать в ML-поток."""
+        if recording or enroll_buf["on"]:
+            rumps.alert(title, "Идёт другая запись — дождись конца и повтори.")
+            return
+        if STATE["loading"]:
+            rumps.alert(title, "Модели ещё грузятся — попробуй через несколько секунд.")
+            return
+        rumps.alert(title, body)  # ждём ОК: отсчёт начинается, когда человек готов
+
+        def run():
+            token = ("vp", time.time())
+            try:
+                ensure_stream()
+                with lock:
+                    enroll_buf["chunks"].clear()
+                    enroll_buf["on"] = True
+                hud.play("start")
+                hud.show("rec", token)  # видно, что идёт запись, и как громко
+                deadline = time.time() + seconds
+                while time.time() < deadline:
+                    left = deadline - time.time()
+                    STATE["vp_countdown"] = f"🔴 {left:.0f}с"
+                    time.sleep(0.1)
+                with lock:
+                    enroll_buf["on"] = False
+                    a = (np.concatenate(enroll_buf["chunks"]).flatten().astype(np.float32)
+                         if enroll_buf["chunks"] else np.zeros(0, dtype=np.float32))
+                    enroll_buf["chunks"].clear()
+                STATE.pop("vp_countdown", None)
+                hud.show("busy", token)
+                if len(a) < seconds * SAMPLE_RATE * 0.5:
+                    raise ValueError("микрофон не отдал звук — проверь вход и повтори")
+                jobs.put((kind, a))
+            except Exception as e:
+                print(f"  ✗ запись голоса не вышла: {e}", flush=True)
+                notify_ui(title, f"Не получилось: {e}")
+            finally:
+                with lock:
+                    enroll_buf["on"] = False
+                STATE.pop("vp_countdown", None)
+                hud.hide(token)
+        threading.Thread(target=run, daemon=True).start()
 
     def enroll(self, _):
-        rumps.alert("Отпечаток голоса",
-                    "После ОК говори 5 секунд обычным голосом — любую фразу.")
-        def rec():
-            try:
-                with reopen_lock:  # параллельная проба устройства обрывает запись
-                    a = sd.rec(int(5 * SAMPLE_RATE), samplerate=SAMPLE_RATE,
-                               channels=1, dtype="float32")
-                    sd.wait()
-                jobs.put(("enroll", a.flatten().astype(np.float32)))
-            except Exception as e:
-                print(f"  ✗ отпечаток не записан: {e}", flush=True)
-        threading.Thread(target=rec, daemon=True).start()
+        self._capture(
+            "enroll", VP_RECORD_SEC, "Запись отпечатка голоса",
+            f"После «ОК» говори {VP_RECORD_SEC} секунд обычным голосом, без "
+            "длинных пауз — читай любой текст вслух.\n\n"
+            "Пока идёт запись, у курсора видна капсула с уровнем звука, а в "
+            "меню-баре — обратный отсчёт. По итогу покажу, что получилось.\n\n"
+            f"Микрофон сейчас: {STATE['mic']}. Отпечаток привязан к микрофону — "
+            "для другого (например, AirPods) запиши заново на нём.")
+
+    def vp_check_run(self, _):
+        self._capture(
+            "vpcheck", VP_CHECK_SEC, "Проверка голоса",
+            f"После «ОК» скажи фразу — {VP_CHECK_SEC} секунды.\n\n"
+            "Покажу, узнаю ли я тебя и с каким запасом до порога.")
 
     def refresh_recent(self, _):
         try:
