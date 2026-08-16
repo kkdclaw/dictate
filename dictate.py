@@ -157,15 +157,25 @@ def _repo_dir(repo: str) -> str:
     return os.path.join(HF_HUB_CACHE, "models--" + repo.replace("/", "--"))
 
 
-def _repo_status(repo: str, full_mb) -> dict:
+_repo_cache = {}  # repo -> (время, статус): os.walk по кэшу HF раз в 3 с, не чаще
+
+
+def _repo_status(repo: str, full_mb, max_age=3.0) -> dict:
     """Модель в кэше HF: скачана / качается / нет, размер на диске, путь.
 
     «Качается» — в blobs есть свежий *.incomplete (осиротевший после прерванной
     закачки не считаем); «скачана» — в snapshots есть файлы и закачек нет."""
     import glob
+    cached = _repo_cache.get(repo)
+    if cached and time.time() - cached[0] < max_age:
+        st = dict(cached[1])
+        st["full"] = full_mb
+        return st
     d = _repo_dir(repo)
     if not os.path.isdir(d):
-        return {"path": d, "state": "none", "mb": 0.0, "full": full_mb}
+        st = {"path": d, "state": "none", "mb": 0.0, "full": full_mb}
+        _repo_cache[repo] = (time.time(), st)
+        return st
     incomplete = [p for p in glob.glob(os.path.join(d, "blobs", "*.incomplete"))
                   if time.time() - os.path.getmtime(p) < 300]
     snaps = glob.glob(os.path.join(d, "snapshots", "*", "*"))
@@ -185,7 +195,9 @@ def _repo_status(repo: str, full_mb) -> dict:
         state = "partial"
     else:
         state = "none"
-    return {"path": d, "state": state, "mb": _dir_size_mb(d), "full": full_mb}
+    st = {"path": d, "state": state, "mb": _dir_size_mb(d), "full": full_mb}
+    _repo_cache[repo] = (time.time(), st)
+    return st
 
 
 def _model_row(label: str, st: dict, active: bool) -> str:
@@ -1138,9 +1150,10 @@ class DictateApp(rumps.App):
 
         self.models_menu = rumps.MenuItem("Модели")
         self.status_item = rumps.MenuItem("Состояние и разрешения…", callback=self.open_status)
+        self.perm_item = rumps.MenuItem("Настроить разрешения…", callback=self.open_perm_wizard)
         self.hud_menu = self._build_hud_menu()
 
-        self.menu = [self.status_item, self.mic_item, self.recent, None,
+        self.menu = [self.status_item, self.perm_item, self.mic_item, self.recent, None,
                      self.profile, self.default_style, self.translate_item, None,
                      self.vp_item,
                      rumps.MenuItem("Записать отпечаток голоса (5 с)", callback=self.enroll),
@@ -1242,6 +1255,13 @@ class DictateApp(rumps.App):
         if CONFIG["sounds"]:
             hud.play("done")
 
+    def restart_now(self, _):
+        threading.Thread(target=restart_app, daemon=True).start()
+
+    def open_perm_wizard(self, _):
+        # диалоги ждут пользователя минутами — главный поток занимать нельзя
+        threading.Thread(target=permissions_wizard, daemon=True).start()
+
     # --- окно состояния -------------------------------------------------------
     def open_status(self, _, activate=True):
         statuspanel.show(self.status_snapshot, activate=activate, actions={
@@ -1258,6 +1278,7 @@ class DictateApp(rumps.App):
             "dir:asr": lambda: subprocess.run(["open", _repo_dir(CONFIG["asr_model"])]),
             "dir:llm": lambda: subprocess.run(["open", _repo_dir(CONFIG["llm_model"])]),
             "hud_test": lambda: hud.preview(2.5),
+            "wizard": lambda: self.open_perm_wizard(None),
         })
 
     def _download_role(self, role):
@@ -1277,16 +1298,36 @@ class DictateApp(rumps.App):
                 perm_status()
             except Exception:
                 pass
-        issues = any(v != "ok" for v in STATE["perms"].values())
+        perms = STATE["perms"]
+        need_restart = perms_need_restart()
+        issues = any(v != "ok" for v in perms.values())
         self.status_item.title = ("⚠️ Состояние и разрешения…" if issues
                                   else "Состояние и разрешения…")
+        if need_restart:
+            title = "⚠️ Разрешения выданы — перезапустить службу"
+            cb = self.restart_now
+        elif issues:
+            title = "Настроить разрешения…"
+            cb = self.open_perm_wizard
+        else:
+            title = "Разрешения: все выданы"
+            cb = self.open_perm_wizard
+        if self.perm_item.title != title:
+            self.perm_item.title = title
+        if getattr(self, "_perm_cb", None) is not cb:  # не перерегистрируем каждую секунду
+            self._perm_cb = cb
+            self.perm_item.set_callback(cb)
 
     def status_snapshot(self):
         perms = perm_status()
         STATE["perms_ts"] = time.time()
         # --- служба ---
+        need_restart = perms_need_restart()
         if STATE["error"]:
             svc = f"❌ {STATE['error']}"
+        elif need_restart:
+            svc = ("⚠️ Разрешения выданы, но не применены: " + ", ".join(need_restart)
+                   + " — нажми «Перезапустить»")
         elif STATE["loading"]:
             svc = ("⏳ Модели загружаются в память (после старта ~20–30 с, при первом "
                    "запуске — скачиваются)")
@@ -1309,16 +1350,28 @@ class DictateApp(rumps.App):
              "Лог…", "log"),
         ]
         # --- разрешения ---
-        icons = {"ok": "✅ выдано", "ask": "❔ ещё не спрашивали — нажми «Запросить»",
+        icons = {"ok": "✅ выдано",
+                 "restart": "☑️ галка включена, но применится после перезапуска службы",
+                 "ask": "❔ ещё не спрашивали — нажми «Запросить»",
                  "denied": "❌ нет — включи галку в Настройках для процесса ниже"}
         prows = []
-        for name in PRIVACY_PANES:
+        missing = [n for n in PERM_ORDER if perms[n] != "ok"]
+        if missing:
+            prows.append(("Мастер настройки",
+                          "Проведу по недостающим разрешениям по одному, с "
+                          "объяснением и ожиданием — вместо трёх запросов разом",
+                          "Настроить по очереди", "wizard"))
+        for name in PERM_ORDER:
             st = perms[name]
-            btn = None if st == "ok" else ("Запросить" if st == "ask" else "Открыть Настройки")
-            prows.append((name, f"{icons[st]} · нужно, чтобы {PERM_WHY[name]}", btn, f"perm:{name}"))
+            btn = {"ok": None, "restart": "Перезапустить", "ask": "Запросить",
+                   "denied": "Открыть Настройки"}[st]
+            act = "restart" if st == "restart" else f"perm:{name}"
+            prows.append((name, f"{icons[st]} · нужно, чтобы {PERM_WHY[name]}", btn, act))
         binary = os.path.realpath(sys.executable)
-        prows.append(("Кому выдавать", f"{binary}\nПосле включения галки нажми «Перезапустить» "
-                      "— macOS применяет разрешения к новому процессу.", "Показать в Finder", "reveal"))
+        prows.append(("Кому выдавать", f"{binary}\nВ списке Настроек это файл python3.12. "
+                      "«Мониторинг ввода» и «Универсальный доступ» macOS отдаёт только "
+                      "новому процессу — после включения галки нужен перезапуск.",
+                      "Показать в Finder", "reveal"))
         # --- микрофон ---
         devs = input_devices()
         mic = [
@@ -1463,6 +1516,7 @@ class DictateApp(rumps.App):
                 print(f"  модель {repo} не скачалась: {e}", flush=True)
             finally:
                 self._downloading.discard(repo)
+                _repo_cache.pop(repo, None)
                 self._models_sig = ""
         threading.Thread(target=dl, daemon=True).start()
         self._models_sig = ""  # прогресс появится при следующем обновлении
@@ -1480,6 +1534,7 @@ class DictateApp(rumps.App):
         def rm():  # rmtree на 17 ГБ в главном потоке морозит меню на секунды
             shutil.rmtree(path, ignore_errors=True)
             print(f"Модель {repo} удалена с диска.", flush=True)
+            _repo_cache.pop(repo, None)
             self._models_sig = ""
         threading.Thread(target=rm, daemon=True).start()
 
@@ -1594,10 +1649,12 @@ class DictateApp(rumps.App):
         try:
             import importlib, dashboard
             importlib.reload(dashboard)
-            with open(dashboard.OUT, "w") as f:
+            # своё имя файла на вкладку: иначе второе окно перетирает первое
+            out = dashboard.OUT.replace(".html", f"-{mode}.html")
+            with open(out, "w") as f:
                 f.write(dashboard.build(mode))
             title = "Статистика — dictate" if mode == "stats" else "Поиск истории — dictate"
-            webwindow.show(title, dashboard.OUT)
+            webwindow.show(title, out)
         except Exception as e:
             print(f"  окно не открылось: {e}", flush=True)
 
@@ -1629,13 +1686,51 @@ PERM_WHY = {
 }
 
 
+PERM_ORDER = ["Микрофон", "Мониторинг ввода", "Универсальный доступ"]
+PERM_HINT = {  # что увидит пользователь в Настройках
+    "Микрофон": "Конфиденциальность и безопасность → Микрофон",
+    "Мониторинг ввода": "Конфиденциальность и безопасность → Мониторинг ввода",
+    "Универсальный доступ": "Конфиденциальность и безопасность → Универсальный доступ",
+}
+# «Мониторинг ввода» и «Универсальный доступ» кешируются в процессе на всю его
+# жизнь: после включения галки текущий процесс продолжает считать, что права
+# нет. Свежее состояние узнаём у дочернего процесса того же бинарника (TCC
+# смотрит на путь, поэтому ответ — про нас), и предлагаем перезапуск.
+_EXTERNAL_PROBE = (
+    'import ctypes,json;'
+    'io=ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit");'
+    'ax=ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework'
+    '/ApplicationServices");'
+    'ax.AXIsProcessTrusted.restype=ctypes.c_bool;'
+    'print(json.dumps({"hid":io.IOHIDCheckAccess(1),"ax":bool(ax.AXIsProcessTrusted())}))'
+)
+_external = {"ts": 0.0, "data": {}}
+
+
 def _iokit():
     import ctypes
     return ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
 
 
-def perm_status() -> dict:
-    """{имя: 'ok' | 'ask' | 'denied'} — ask = система ещё покажет диалог."""
+def external_perms(max_age=3.0) -> dict:
+    """{'hid': код, 'ax': bool} по мнению СВЕЖЕГО процесса (или {})."""
+    if time.time() - _external["ts"] < max_age:
+        return _external["data"]
+    data = {}
+    try:
+        out = subprocess.run([sys.executable, "-c", _EXTERNAL_PROBE],
+                             capture_output=True, text=True, timeout=10)
+        data = json.loads(out.stdout.strip() or "{}")
+    except Exception:
+        data = {}
+    _external.update(ts=time.time(), data=data)
+    return data
+
+
+def perm_status(check_external=True) -> dict:
+    """{имя: 'ok' | 'restart' | 'ask' | 'denied'}.
+
+    restart — галка уже включена, но применится только к новому процессу."""
     from ApplicationServices import AXIsProcessTrusted
     from AVFoundation import AVCaptureDevice
     mic = AVCaptureDevice.authorizationStatusForMediaType_("soun")  # 0 не опр., 3 ок
@@ -1645,8 +1740,20 @@ def perm_status() -> dict:
         "Мониторинг ввода": "ok" if hid == 0 else "ask" if hid == 2 else "denied",
         "Универсальный доступ": "ok" if AXIsProcessTrusted() else "denied",
     }
+    if check_external and (st["Мониторинг ввода"] != "ok"
+                           or st["Универсальный доступ"] != "ok"):
+        ext = external_perms()
+        if ext.get("hid") == 0 and st["Мониторинг ввода"] != "ok":
+            st["Мониторинг ввода"] = "restart"
+        if ext.get("ax") and st["Универсальный доступ"] != "ok":
+            st["Универсальный доступ"] = "restart"
     STATE["perms"] = st
+    STATE["perms_ts"] = time.time()
     return st
+
+
+def perms_need_restart() -> list:
+    return [n for n, v in STATE["perms"].items() if v == "restart"]
 
 
 def open_privacy_pane(name: str):
@@ -1664,7 +1771,7 @@ def request_permission(name: str, quiet=False):
     from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
     from AVFoundation import AVCaptureDevice
     st = perm_status().get(name)
-    if st == "ok":
+    if st in ("ok", "restart"):
         return
     if name == "Микрофон":
         if st == "ask":
@@ -1684,39 +1791,133 @@ def request_permission(name: str, quiet=False):
     open_privacy_pane(name)
 
 
-def request_permissions():
-    """При старте: проверить все три TCC-разрешения и запросить недостающие.
+def _dialog(text: str, buttons, default=None, timeout=300):
+    """Модальный диалог через osascript; возвращает нажатую кнопку или None."""
+    btns = ", ".join('"%s"' % b.replace('"', "'") for b in buttons)
+    script = (f'display dialog "{text}" with title "Dictate — разрешения" '
+              f'buttons {{{btns}}} default button "{default or buttons[-1]}" '
+              f'giving up after {timeout}')
+    try:
+        out = subprocess.run(["osascript", "-e", script], capture_output=True,
+                             text=True, timeout=timeout + 15).stdout
+    except Exception:
+        return None
+    for b in buttons:
+        if f"button returned:{b}" in out:
+            return b
+    return None
 
-    Системный диалог macOS показывает только в статусе «не определён»; после
-    отказа молча отказывает — тогда открываем нужную панель Настроек сами и
-    показываем в Finder бинарник, который надо добавить в список."""
+
+def _wait_granted(name: str, seconds=120) -> bool:
+    """Ждём, пока разрешение появится (в процессе или у свежего процесса)."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if perm_status()[name] in ("ok", "restart"):
+            return True
+        time.sleep(1.5)
+    return False
+
+
+def permissions_wizard():
+    """Проводник по разрешениям: по одному, с объяснением и ожиданием.
+
+    Раньше при каждом старте вылетали все три запроса разом плюс Finder и
+    Настройки — теперь это осознанное действие пользователя из меню."""
+    if STATE.get("perm_wizard"):
+        return
+    STATE["perm_wizard"] = True
+    try:
+        todo = [n for n in PERM_ORDER if perm_status()[n] not in ("ok", "restart")]
+        if not todo:
+            need = perms_need_restart()
+            if need:
+                if _dialog("Разрешения выданы, но применятся только после "
+                           "перезапуска службы.\n\nПерезапустить сейчас? "
+                           "Займёт около 20 секунд.",
+                           ["Позже", "Перезапустить"], "Перезапустить", 120) == "Перезапустить":
+                    restart_app()
+            else:
+                _dialog("Все разрешения уже выданы — диктовка готова к работе.",
+                        ["ОК"], "ОК", 60)
+            return
+        binary = os.path.realpath(sys.executable)
+        start = _dialog(
+            f"Нужно выдать {len(todo)} разрешени(я): {', '.join(todo)}.\n\n"
+            "Пойдём по одному: для каждого покажу системный запрос или открою "
+            "нужный раздел Настроек. В списке Настроек включи галку для файла "
+            f"python3.12 (это и есть служба диктовки).",
+            ["Отмена", "Начать"], "Начать", 300)
+        if start != "Начать":
+            return
+        for i, name in enumerate(todo, 1):
+            st = perm_status()[name]
+            if st in ("ok", "restart"):
+                continue
+            head = f"Шаг {i} из {len(todo)}: {name}"
+            if st == "ask":
+                body = (f"{head}\n\nНужно, чтобы {PERM_WHY[name]}.\n\n"
+                        "Сейчас появится системный запрос — нажми «Разрешить».")
+                if _dialog(body, ["Пропустить", "Показать запрос"],
+                           "Показать запрос") != "Показать запрос":
+                    continue
+                request_permission(name, quiet=True)
+            else:
+                body = (f"{head}\n\nНужно, чтобы {PERM_WHY[name]}.\n\n"
+                        f"Система больше не покажет запрос сама — открою "
+                        f"{PERM_HINT[name]} и покажу файл в Finder. Перетащи его "
+                        f"в список (или включи галку, если он уже там), потом "
+                        f"вернись сюда.\n\n{binary}")
+                if _dialog(body, ["Пропустить", "Открыть Настройки"],
+                           "Открыть Настройки") != "Открыть Настройки":
+                    continue
+                reveal_binary()
+                open_privacy_pane(name)
+            if _wait_granted(name):
+                print(f"  ✓ разрешение «{name}» выдано", flush=True)
+            else:
+                print(f"  … разрешение «{name}» так и не выдано", flush=True)
+        left = [n for n in PERM_ORDER if perm_status()[n] not in ("ok", "restart")]
+        need = perms_need_restart()
+        if need:
+            msg = ("Готово: " + ", ".join(n for n in PERM_ORDER if n not in left)
+                   + ".\n\nЧтобы «" + "», «".join(need) + "» заработало, службу "
+                   "нужно перезапустить (macOS отдаёт эти разрешения только "
+                   "новому процессу). Перезапустить сейчас?")
+            if _dialog(msg, ["Позже", "Перезапустить"], "Перезапустить", 120) == "Перезапустить":
+                restart_app()
+        elif left:
+            _dialog("Осталось выдать: " + ", ".join(left)
+                    + ".\n\nМожно вернуться к этому в меню → «Настроить "
+                      "разрешения…».", ["ОК"], "ОК", 60)
+        else:
+            _dialog("Все разрешения выданы — диктовка готова к работе.",
+                    ["ОК"], "ОК", 60)
+    except Exception as e:
+        print(f"  проводник разрешений: {e}", flush=True)
+    finally:
+        STATE["perm_wizard"] = False
+
+
+def check_permissions_at_start():
+    """При старте только смотрим и пишем в лог: никаких запросов пачкой.
+
+    Системные запросы всё равно появятся сами в момент использования (открытие
+    микрофона, слушатель клавиш), а недостающее пользователь выдаёт из меню
+    → «Настроить разрешения…» по очереди."""
     st = perm_status()
     missing = [n for n, v in st.items() if v != "ok"]
     if not missing:
         print("Разрешения: все выданы.", flush=True)
         return []
-    binary = os.path.realpath(sys.executable)
-    print(f"⚠ Нет разрешений: {', '.join(missing)}. Процесс, которому надо их "
-          f"выдать: {binary}", flush=True)
-    denied = [n for n in missing if st[n] == "denied"]
-    for n in missing:
-        if st[n] == "ask" or n == "Универсальный доступ":
-            request_permission(n, quiet=True)  # системные диалоги
-    if denied:
-        # Не чаще раза в 10 минут: с KeepAlive перезапуски сыпали бы окнами
-        marker = os.path.join(tempfile.gettempdir(), "dictate-perm-prompt")
-        recent = (os.path.exists(marker)
-                  and time.time() - os.path.getmtime(marker) < 600)
-        print(f"  Диалог система уже не покажет ({', '.join(denied)}). Добавь "
-              f"бинарник в список (перетаскиванием), включи галку и нажми "
-              f"«Перезапустить» в окне состояния.", flush=True)
-        if not recent:
-            try:
-                open(marker, "w").close()
-            except OSError:
-                pass
-            reveal_binary()
-            open_privacy_pane(denied[0])
+    need = [n for n in missing if st[n] == "restart"]
+    if need:
+        print(f"⚠ Разрешения выданы, но применятся после перезапуска: "
+              f"{', '.join(need)}. Меню → «Перезапустить службу».", flush=True)
+    rest = [n for n in missing if st[n] != "restart"]
+    if rest:
+        print(f"⚠ Нет разрешений: {', '.join(rest)}. Меню-бар → «Настроить "
+              f"разрешения…» проведёт по одному. Процесс, которому их выдавать: "
+              f"{os.path.realpath(sys.executable)}", flush=True)
     return missing
 
 
@@ -1820,7 +2021,7 @@ def _open_stream_quiet():
 
 def main():
     load_config()
-    missing = request_permissions()
+    missing = check_permissions_at_start()
     ask_first_download()
     # окно состояния при старте: нет разрешений или активные модели ещё не на диске
     need_dl = any(_repo_status(CONFIG[ROLE_CFG[r]], 0)["state"] != "done" for r in ROLES)

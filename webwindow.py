@@ -15,11 +15,21 @@ _windows = {}  # title -> (NSWindow, WKWebView)
 
 def show(title: str, html_path: str, width: int = 1180, height: int = 820):
     existing = _windows.get(title)
-    url = NSURL.fileURLWithPath_(os.path.abspath(html_path))
-    req = AppKit.NSURLRequest.requestWithURL_(url)
+    path = os.path.abspath(html_path)
+    url = NSURL.fileURLWithPath_(path)
+    base = NSURL.fileURLWithPath_(os.path.dirname(path))
+
+    def load(web):
+        # loadFileURL даёт странице доступ к своей папке; loadRequest_ с file:
+        # работает не везде и не пускает к соседним ресурсам
+        try:
+            web.loadFileURL_allowingReadAccessToURL_(url, base)
+        except Exception:
+            web.loadRequest_(AppKit.NSURLRequest.requestWithURL_(url))
+
     if existing is not None:
         win, web = existing
-        web.loadRequest_(req)
+        load(web)
         win.makeKeyAndOrderFront_(None)
         AppKit.NSApp.activateIgnoringOtherApps_(True)
         return
@@ -35,7 +45,7 @@ def show(title: str, html_path: str, width: int = 1180, height: int = 820):
 
     web = WebKit.WKWebView.alloc().initWithFrame_(rect)
     web.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
-    web.loadRequest_(req)
+    load(web)
     win.contentView().addSubview_(web)
 
     win.makeKeyAndOrderFront_(None)

@@ -24,3 +24,4 @@ voiceprint.npy
 models/
 auto_terms.txt
 dashboard.html
+dashboard-*.html

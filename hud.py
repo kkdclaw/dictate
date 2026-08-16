@@ -350,6 +350,18 @@ def _target_frame(w, h):
     return NSMakeRect(x, y, w, h)
 
 
+def _system_is_dark() -> bool:
+    try:
+        app = AppKit.NSApp
+        if app is None:
+            return False
+        match = app.effectiveAppearance().bestMatchFromAppearancesWithNames_(
+            [AppKit.NSAppearanceNameAqua, AppKit.NSAppearanceNameDarkAqua])
+        return str(match) == str(AppKit.NSAppearanceNameDarkAqua)
+    except Exception:
+        return "Dark" in str(AppKit.NSApp.effectiveAppearance().name())
+
+
 # --- вью и панель ------------------------------------------------------------
 class HUDView(AppKit.NSView):
     def isFlipped(self):
@@ -360,8 +372,7 @@ class HUDView(AppKit.NSView):
         w, h = b.size.width, b.size.height
         bg = _cfg["hud_bg"]
         if bg == "system":
-            name = AppKit.NSApp.effectiveAppearance().name() if AppKit.NSApp else ""
-            bg = "dark" if "Dark" in str(name) else "light"
+            bg = "dark" if _system_is_dark() else "light"
         if bg == "dark":
             fill = AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.08, 0.86)
             stroke = AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.12)
@@ -459,11 +470,10 @@ def _symbol(name, size, color):
         if img is not None:
             cfg = AppKit.NSImageSymbolConfiguration.configurationWithPointSize_weight_(
                 size, AppKit.NSFontWeightSemibold)
-            try:
-                cfg = cfg.configurationByApplyingConfiguration_(
-                    AppKit.NSImageSymbolConfiguration.configurationWithHierarchicalColor_(color))
-            except Exception:
-                pass
+            # без цветовой конфигурации (macOS < 12) символ рисуется чёрным
+            # мимо темы и акцента — тогда честно откатываемся на столбики
+            cfg = cfg.configurationByApplyingConfiguration_(
+                AppKit.NSImageSymbolConfiguration.configurationWithHierarchicalColor_(color))
             img = img.imageWithSymbolConfiguration_(cfg)
     except Exception:
         img = None

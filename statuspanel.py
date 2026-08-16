@@ -132,7 +132,9 @@ def _layout(sections):
         _grid.leadingAnchor().constraintEqualToAnchor_constant_(content.leadingAnchor(), m),
         _footer.topAnchor().constraintEqualToAnchor_constant_(_grid.bottomAnchor(), 12.0),
         _footer.leadingAnchor().constraintEqualToAnchor_constant_(content.leadingAnchor(), m),
-        _footer.bottomAnchor().constraintEqualToAnchor_constant_(content.bottomAnchor(), -m),
+        # >= : при маленьком содержимом окно не «дерётся» с минимальной высотой
+        _footer.bottomAnchor().constraintLessThanOrEqualToAnchor_constant_(
+            content.bottomAnchor(), -m),
         _grid.trailingAnchor().constraintEqualToAnchor_constant_(content.trailingAnchor(), -m),
     ])
     _fit()
