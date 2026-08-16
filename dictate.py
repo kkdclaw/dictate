@@ -7,6 +7,7 @@
 import collections
 import json
 import os
+import platform
 import queue
 import re
 import sqlite3
@@ -30,6 +31,12 @@ import hud
 import statuspanel
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+# Семантическая версия. Держим синхронно с pyproject.toml и git-тегом vX.Y.Z:
+#   MAJOR — несовместимые изменения (формат конфига/истории, смена хоткея по умолчанию)
+#   MINOR — новые возможности
+#   PATCH — исправления без новых возможностей
+# Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
+VERSION = "0.4.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -1149,6 +1156,8 @@ class DictateApp(rumps.App):
         self.vp_item.state = int(CONFIG["only_my_voice"])
 
         self.models_menu = rumps.MenuItem("Модели")
+        # версия в меню: видно без открытия панели, клик — копия для отчёта об ошибке
+        self.about_item = rumps.MenuItem(f"Версия {app_version()}", callback=self.copy_version)
         self.status_item = rumps.MenuItem("Состояние и разрешения…", callback=self.open_status)
         self.perm_item = rumps.MenuItem("Настроить разрешения…", callback=self.open_perm_wizard)
         self.hud_menu = self._build_hud_menu()
@@ -1165,7 +1174,8 @@ class DictateApp(rumps.App):
                      rumps.MenuItem("Поиск истории…", callback=self.open_search),
                      rumps.MenuItem("Словарь терминов…", callback=self.open_terms),
                      rumps.MenuItem("Обновить автословарь из истории", callback=self.suggest),
-                     rumps.MenuItem("Лог…", callback=self.open_log), None]
+                     rumps.MenuItem("Лог…", callback=self.open_log), None,
+                     self.about_item]
         rumps.Timer(self.refresh_title, 0.3).start()
         rumps.Timer(self.refresh_recent, 3.0).start()
         self.refresh_models(None)
@@ -1266,6 +1276,7 @@ class DictateApp(rumps.App):
     def open_status(self, _, activate=True):
         statuspanel.show(self.status_snapshot, activate=activate, actions={
             "restart": restart_app,
+            "copy_version": lambda: self.copy_version(None),
             "log": lambda: self.open_log(None),
             "reopen": lambda: threading.Thread(target=reopen_stream, daemon=True).start(),
             "reveal": reveal_binary,
@@ -1344,10 +1355,11 @@ class DictateApp(rumps.App):
         plist = os.path.expanduser("~/Library/LaunchAgents/com.kkd.dictate.plist")
         how = "демон launchd (com.kkd.dictate, автозапуск при входе)" if os.path.exists(plist) \
             else "вручную (без демона — после выхода не поднимется сам)"
+        stale = " · ⬆️ на диске новее — перезапусти" if code_updated_on_disk() else ""
         service = [
             ("Состояние", svc, "Перезапустить", "restart"),
-            ("Процесс", f"PID {os.getpid()} · работает {upt} · версия {self._version} · {how}",
-             "Лог…", "log"),
+            ("Версия", f"{self._version}{stale}", "Скопировать", "copy_version"),
+            ("Процесс", f"PID {os.getpid()} · работает {upt} · {how}", "Лог…", "log"),
         ]
         # --- разрешения ---
         icons = {"ok": "✅ выдано",
@@ -1633,6 +1645,23 @@ class DictateApp(rumps.App):
 
     def copy_item(self, sender):
         subprocess.run(["pbcopy"], input=sender._full_text.encode())
+
+    def copy_version(self, _):
+        """Клик по версии — в буфер полная справка для отчёта об ошибке."""
+        info = "\n".join([
+            f"Dictate {app_version()}",
+            f"macOS {platform.mac_ver()[0]} · {platform.machine()} · "
+            f"Python {platform.python_version()}",
+            f"ASR {CONFIG['asr_model']} · LLM {CONFIG['llm_model']}",
+            f"Микрофон: {STATE['mic']}",
+        ])
+        subprocess.run(["pbcopy"], input=info.encode())
+        self.about_item.title = "Версия скопирована ✓"
+        rumps.Timer(self._restore_about, 2.0).start()
+
+    def _restore_about(self, timer):
+        timer.stop()
+        self.about_item.title = f"Версия {app_version()}"
 
     def toggle_enhance(self, sender):
         STATE["enhance"] = not STATE["enhance"]
@@ -1951,12 +1980,51 @@ def restart_app():
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-def app_version() -> str:
+def _git(*args) -> str:
     try:
-        return subprocess.run(["git", "-C", BASE, "rev-parse", "--short", "HEAD"],
-                              capture_output=True, text=True, timeout=3).stdout.strip() or "?"
+        r = subprocess.run(["git", "-C", BASE, *args],
+                           capture_output=True, text=True, timeout=3)
+        return r.stdout.strip() if r.returncode == 0 else ""
     except Exception:
-        return "?"
+        return ""
+
+
+def app_version() -> str:
+    """Версия работающего кода: «0.4.0+3 · a1b2c3d · 17.08.2026 · правки».
+
+    Считается ОДИН раз при старте и запоминается: после git pull на диске уже
+    новый код, а в памяти крутится старый — показывать надо тот, что работает.
+    Слагаемые: номер из VERSION (при расхождении с ближайшим тегом верим тегу),
+    «+N» — коммитов после тега, хеш и дата коммита, «правки» — есть
+    незакоммиченные изменения.
+    """
+    if "version" in STATE:
+        return STATE["version"]
+    ver, extra = VERSION, []
+    desc = _git("describe", "--tags", "--long", "--dirty", "--match", "v[0-9]*")
+    if desc:  # v0.4.0-3-ga1b2c3d[-dirty]
+        parts = desc.split("-")
+        tag, ahead = parts[0].lstrip("v"), parts[1]
+        ver = tag  # тег на коммите — источник правды; VERSION нужен без git
+        if ahead != "0":
+            ver += f"+{ahead}"
+    sha = _git("rev-parse", "--short", "HEAD")
+    if sha:
+        extra.append(sha)
+    date = _git("log", "-1", "--format=%cd", "--date=format:%d.%m.%Y")
+    if date:
+        extra.append(date)
+    if desc.endswith("-dirty") or (not desc and _git("status", "--porcelain")):
+        extra.append("правки")
+    STATE["version"] = " · ".join([ver] + extra)
+    STATE["head"] = sha
+    return STATE["version"]
+
+
+def code_updated_on_disk() -> bool:
+    """После git pull код на диске новее работающего — повод перезапустить службу."""
+    head = STATE.get("head")
+    return bool(head) and _git("rev-parse", "--short", "HEAD") not in ("", head)
 
 
 def _choose_model_dialog(role: str) -> str | None:
@@ -2020,6 +2088,7 @@ def _open_stream_quiet():
 
 
 def main():
+    print(f"Dictate {app_version()}", flush=True)  # первой строкой лога: что именно запустилось
     load_config()
     missing = check_permissions_at_start()
     ask_first_download()
@@ -2048,4 +2117,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print(f"Dictate {app_version()}")
+    else:
+        main()
