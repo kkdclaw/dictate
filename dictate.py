@@ -37,7 +37,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -91,7 +91,6 @@ STYLES = {  # ключ -> подпись в меню
 }
 CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "translate_all": False, "vp_threshold": 0.40, "enhance": True,
-          "check_updates": True,  # спрашивать GitHub о новой версии (ничего не ставит сам)
           "asr_model": ASR_MODEL, "llm_model": LLM_MODEL,
           **hud.DEFAULTS}  # индикатор записи и звуки
 
@@ -1361,12 +1360,8 @@ class DictateApp(rumps.App):
         self.ver_item = rumps.MenuItem(f"Версия {app_version()}",
                                        callback=self.copy_version)
         self.upd_item = rumps.MenuItem("Обновления: …", callback=self.update_clicked)
-        self.upd_auto = rumps.MenuItem("Проверять автоматически",
-                                       callback=self.toggle_check_updates)
-        self.upd_auto.state = int(CONFIG["check_updates"])
         m.add(self.ver_item)
         m.add(self.upd_item)
-        m.add(self.upd_auto)
         return m
 
     def refresh_about(self, _=None):
@@ -1379,17 +1374,13 @@ class DictateApp(rumps.App):
         if title != self.ver_item.title:
             self.ver_item.title = title
 
-    def toggle_check_updates(self, sender):
-        CONFIG["check_updates"] = not CONFIG["check_updates"]
-        sender.state = int(CONFIG["check_updates"])
-        save_config()
-        if CONFIG["check_updates"]:
-            self.update_clicked(None, silent=True)
-
-    def update_clicked(self, _, silent=False):
-        """Клик по строке обновлений: если есть новое — спрашиваем и ставим,
-        иначе просто проверяем заново."""
+    def update_clicked(self, _):
+        """Клик по строке обновлений: первый раз — спрашиваем GitHub, и если
+        нашлось новое, следующий клик предлагает поставить. Сама программа в
+        сеть не ходит — только по этой кнопке."""
         u = STATE.get("update") or {}
+        if u.get("busy"):
+            return  # запрос уже в полёте
         if u.get("tag") or u.get("commits"):
             what = (f"версии {u['tag']}" if u.get("tag") else "свежих правок с main")
             if rumps.alert("Обновление Dictate",
@@ -1404,10 +1395,18 @@ class DictateApp(rumps.App):
             return
 
         def probe():
-            STATE["update"] = check_update()
-            if not silent:
+            STATE["update"] = {"busy": True}  # в меню видно, что запрос пошёл
+            res = check_update()
+            STATE["update"] = res
+            if res.get("error"):
+                notify_ui("Обновление Dictate", f"Не смог спросить GitHub: {res['error']}")
+            elif res.get("tag") or res.get("commits"):
                 notify_ui("Обновление Dictate",
-                          f"Установлено: {app_version()}\nСостояние: {update_summary()}")
+                          f"Установлено: {app_version()}\nЕсть новое: {update_summary()}\n\n"
+                          "Нажми строку «Обновления» ещё раз, чтобы поставить.")
+            else:
+                notify_ui("Обновление Dictate",
+                          f"Установлено: {app_version()}\nЭто последняя версия.")
         threading.Thread(target=probe, daemon=True).start()
 
     # --- мой голос ------------------------------------------------------------
@@ -2394,7 +2393,7 @@ def code_updated_on_disk() -> bool:
 # Спрашиваем удалённый репозиторий через `git ls-remote`, а не через GitHub API:
 # работает по тому же SSH-ключу, что и push (лишних токенов не нужно), не ест
 # лимит API (60 запросов в час на IP) и не качает объекты — только список ссылок.
-UPDATE_EVERY = 6 * 3600  # как часто проверять; вручную — пункт меню
+# Проверка ТОЛЬКО по кнопке: фоновых походов в сеть у диктовки нет.
 
 
 def _semver(tag: str):
@@ -2483,29 +2482,13 @@ def app_version_of(sha: str) -> str:
     return d or sha[:7]
 
 
-def update_watcher():
-    """Раз в UPDATE_EVERY тихо спрашивает GitHub. Молча: результат живёт в меню
-    и панели, всплывающих окон не показываем — обновление не срочное дело."""
-    time.sleep(20)  # не мешаем прогреву моделей на старте
-    while True:
-        if CONFIG["check_updates"]:
-            res = check_update()
-            STATE["update"] = res
-            if res.get("tag"):
-                print(f"⬆️ Доступна версия {res['tag']} (у нас {VERSION}) — "
-                      f"«О программе → Обновить» в меню", flush=True)
-            elif res.get("error"):
-                print(f"  проверка обновлений не удалась: {res['error']}", flush=True)
-        time.sleep(UPDATE_EVERY)
-
-
 def update_summary() -> str:
     """Строка о состоянии обновлений для меню и панели."""
     u = STATE.get("update")
-    if not CONFIG["check_updates"]:
-        return "проверка выключена"
     if not u:
-        return "проверяю…"
+        return "нажми, чтобы проверить"
+    if u.get("busy"):
+        return "спрашиваю GitHub…"
     when = time.strftime("%H:%M", time.localtime(u.get("checked", 0)))
     if u.get("error"):
         return f"не проверилось ({u['error']})"
@@ -2596,7 +2579,6 @@ def main():
     hud.watch_default_output()  # AirPods подключили — звуки сразу мимо них
     threading.Thread(target=mic_watcher, daemon=True).start()
     threading.Thread(target=stream_watchdog, daemon=True).start()
-    threading.Thread(target=update_watcher, daemon=True).start()
     watch_default_input(mic_changed.set)
     # без darwin_intercept: с ним pynput регистрирует блокирующий слушатель —
     # каждое нажатие в системе ждёт наш Python-колбэк, и macOS отключает его по
