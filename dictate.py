@@ -29,6 +29,7 @@ from AppKit import NSWorkspace
 import webwindow
 import hud
 import statuspanel
+import enrollwindow
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 # Семантическая версия. Держим синхронно с pyproject.toml и git-тегом vX.Y.Z:
@@ -36,7 +37,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -683,7 +684,8 @@ def history_db() -> sqlite3.Connection:
 
 
 MAX_REC_SEC = 600  # предохранитель: забытый toggle не пишет вечно — авто-стоп и обработка
-enroll_buf = {"on": False, "chunks": []}  # захват отпечатка/проверки голоса
+# захват отпечатка/проверки голоса: stop — «хватит, считай», cancel — выбросить
+enroll_buf = {"on": False, "chunks": [], "stop": False, "cancel": False}
 rec_frames = [0]  # счётчик сэмплов текущей записи (под lock)
 overflow_sent = [False]  # авто-стоп ставится один раз на запись, а не на каждый колбэк
 
@@ -975,18 +977,21 @@ def ml_worker(ready: threading.Event):
                 voiceprint = vp["vec"]
                 CONFIG["vp_threshold"] = vp["threshold"]  # порог от разброса, не с потолка
                 save_config()
-                msg = (f"Отпечаток записан: {vp['speech_sec']:.0f}с речи, "
+                msg = (f"Отпечаток записан: {vp['speech_sec']:.0f} с чистой речи, "
                        f"{vp['windows']} окон, микрофон «{vp['device']}».\n"
-                       f"Похожесть окон на себя: {vp['self_min']:.2f}…{vp['self_mean']:.2f}.\n"
-                       f"Порог подобран автоматически: {vp['threshold']}.")
+                       f"Окна похожи друг на друга на {vp['self_min']:.2f}…"
+                       f"{vp['self_mean']:.2f} — порог подобран автоматически: "
+                       f"{vp['threshold']}.\n"
+                       "Теперь включи «Пропускать только мой голос» и при желании "
+                       "нажми «Проверить».")
                 print(f"Отпечаток голоса сохранён ({vp['speech_sec']:.0f}с речи, "
                       f"окон {vp['windows']}, само-похожесть {vp['self_min']:.2f}…"
                       f"{vp['self_mean']:.2f}, порог {vp['threshold']})", flush=True)
-                notify_ui("Отпечаток голоса записан", msg)
+                enrollwindow.finish(True, msg)
             except Exception as e:
                 print(f"  ✗ отпечаток не записан: {e}", flush=True)
-                notify_ui("Отпечаток не записан", f"{e}\n\nПопробуй ещё раз: говори "
-                          "непрерывно, обычным голосом, в тот же микрофон.")
+                enrollwindow.finish(False, f"{e}\nЧитай текст непрерывно, обычным "
+                                    "голосом, в тот же микрофон.", "Попробовать снова")
             continue
         if kind == "vpcheck":
             try:
@@ -997,18 +1002,19 @@ def ml_worker(ready: threading.Event):
                     raise ValueError("речи не слышно — скажи фразу вслух")
                 sim = float(embed(speech) @ voiceprint)
                 thr = CONFIG["vp_threshold"]
-                verdict = ("✅ Узнаю — это твой голос" if sim >= thr else
-                           "❌ Не узнаю — такую диктовку я бы отбросил")
+                ok = sim >= thr
+                verdict = ("Узнаю — это твой голос." if ok else
+                           "Не узнаю — такую диктовку я бы отбросил.")
+                tail = ("Запас хороший." if sim >= thr + 0.1 else
+                        "Запас маленький: перезапиши отпечаток на этом микрофоне "
+                        "или сделай строгость мягче.")
                 print(f"  проверка голоса: сходство {sim:.2f} при пороге {thr}", flush=True)
-                notify_ui("Проверка голоса",
-                          f"{verdict}\n\nСходство {sim:.2f}, порог {thr}.\n"
-                          f"Микрофон: {STATE['mic']}.\n\n"
-                          + ("Запас хороший." if sim >= thr + 0.1 else
-                             "Запас маленький: перезапиши отпечаток на этом микрофоне "
-                             "или сделай строгость мягче."))
+                enrollwindow.finish(ok, f"{verdict}\nСходство {sim:.2f} при пороге "
+                                    f"{thr}, микрофон «{STATE['mic']}». {tail}",
+                                    "Проверить ещё раз")
             except Exception as e:
                 print(f"  ✗ проверка голоса не вышла: {e}", flush=True)
-                notify_ui("Проверка голоса", f"Не получилось: {e}")
+                enrollwindow.finish(False, f"Не получилось: {e}", "Проверить ещё раз")
             continue
         audio, rec_app, token = payload
         ok = False
@@ -1818,9 +1824,9 @@ class DictateApp(rumps.App):
 
     def refresh_title(self, _):
         # ❌ — модели не загрузились; ⚠️ — поток мёртв/переоткрывается
-        title = (STATE.get("vp_countdown")  # запись отпечатка: обратный отсчёт в баре
-                 or ("❌" if STATE["error"] else "⏳" if STATE["loading"]
-                     else "🟠" if recording else "🎙️" if stream_alive() else "⚠️"))
+        title = ("❌" if STATE["error"] else "⏳" if STATE["loading"]
+                 else "🟠" if recording or enroll_buf["on"]
+                 else "🎙️" if stream_alive() else "⚠️")
         if title != self.title:
             self.title = title
         mic = f"Микрофон: {STATE['mic']}"
@@ -1882,66 +1888,100 @@ class DictateApp(rumps.App):
         for it in self.vp_strict.values():
             it.state = int(abs(CONFIG["vp_threshold"] - it._thr) < 0.005)
 
-    def _capture(self, kind, seconds, title, body):
-        """Записать кусок с ОСНОВНОГО потока (тот же микрофон, что у диктовки),
-        показывая капсулу с уровнем, и отдать в ML-поток."""
+    # --- запись отпечатка: окно ведёт человека за руку ------------------------
+    def _vp_open(self, mode):
+        """Открыть окно записи. Сама запись стартует по кнопке в окне — человек
+        успевает прочитать текст и приготовиться."""
         if recording or enroll_buf["on"]:
-            rumps.alert(title, "Идёт другая запись — дождись конца и повтори.")
+            rumps.alert("Отпечаток голоса", "Идёт другая запись — дождись конца.")
             return
         if STATE["loading"]:
-            rumps.alert(title, "Модели ещё грузятся — попробуй через несколько секунд.")
+            rumps.alert("Отпечаток голоса",
+                        "Модели ещё грузятся — попробуй через несколько секунд.")
             return
-        rumps.alert(title, body)  # ждём ОК: отсчёт начинается, когда человек готов
+        self._vp_mode = mode
+        secs = VP_RECORD_SEC if mode == "enroll" else VP_CHECK_SEC
+        need = VP_MIN_SPEECH if mode == "enroll" else 1.0
+        enrollwindow.show(mode, STATE["mic"], secs, need,
+                          on_primary=self._vp_primary, on_secondary=self._vp_secondary)
+
+    def _vp_primary(self):
+        """Одна кнопка на три смысла — «Начать», «Остановить», «Записать заново»."""
+        if enroll_buf["on"]:
+            enroll_buf["stop"] = True      # набрал достаточно, не ждём таймера
+        else:
+            self._vp_begin()
+
+    def _vp_secondary(self):
+        if enroll_buf["on"]:
+            enroll_buf["cancel"] = True
+        else:
+            enrollwindow.close()
+
+    def _vp_begin(self):
+        mode = self._vp_mode
+        kind = "enroll" if mode == "enroll" else "vpcheck"
+        secs = VP_RECORD_SEC if mode == "enroll" else VP_CHECK_SEC
 
         def run():
-            token = ("vp", time.time())
             try:
                 ensure_stream()
                 with lock:
                     enroll_buf["chunks"].clear()
-                    enroll_buf["on"] = True
+                    enroll_buf.update(on=True, stop=False, cancel=False)
                 hud.play("start")
-                hud.show("rec", token)  # видно, что идёт запись, и как громко
-                deadline = time.time() + seconds
+                enrollwindow.recording()
+                # живой счётчик речи: полноценный VAD живёт в ML-потоке и занят,
+                # поэтому здесь простая энергетическая оценка от уровня шума —
+                # человеку нужно видеть, что паузы не засчитываются, а точную
+                # длительность речи посчитает VAD при обработке
+                floor, speech, seen, level = None, 0.0, 0, 0.0
+                deadline = time.time() + secs
                 while time.time() < deadline:
-                    left = deadline - time.time()
-                    STATE["vp_countdown"] = f"🔴 {left:.0f}с"
-                    time.sleep(0.1)
+                    if enroll_buf["stop"] or enroll_buf["cancel"]:
+                        break
+                    time.sleep(0.08)
+                    with lock:
+                        blocks = enroll_buf["chunks"][seen:]
+                        seen += len(blocks)
+                    for b in blocks:
+                        rms = float(np.sqrt((b ** 2).mean()))
+                        level = rms
+                        if floor is None and seen >= 6:
+                            floor = rms  # первые блоки — фон комнаты
+                        if rms > max(3 * (floor or 0.0), 0.004):
+                            speech += len(b) / SAMPLE_RATE
+                    enrollwindow.update(min(1.0, level * 12), max(0.0, deadline - time.time()),
+                                        speech)
+                cancelled = enroll_buf["cancel"]
                 with lock:
                     enroll_buf["on"] = False
                     a = (np.concatenate(enroll_buf["chunks"]).flatten().astype(np.float32)
                          if enroll_buf["chunks"] else np.zeros(0, dtype=np.float32))
                     enroll_buf["chunks"].clear()
-                STATE.pop("vp_countdown", None)
-                hud.show("busy", token)
-                if len(a) < seconds * SAMPLE_RATE * 0.5:
-                    raise ValueError("микрофон не отдал звук — проверь вход и повтори")
+                if cancelled:
+                    print("  ✗ запись отпечатка отменена", flush=True)
+                    enrollwindow.close()
+                    return
+                if len(a) < SAMPLE_RATE * 0.5:
+                    raise ValueError("микрофон не отдал звук — проверь вход в меню "
+                                     "«Микрофон» и повтори")
+                enrollwindow.busy("Считаю отпечаток…" if kind == "enroll"
+                                  else "Сравниваю с отпечатком…")
                 jobs.put((kind, a))
             except Exception as e:
                 print(f"  ✗ запись голоса не вышла: {e}", flush=True)
-                notify_ui(title, f"Не получилось: {e}")
+                enrollwindow.finish(False, str(e), "Попробовать снова")
             finally:
                 with lock:
                     enroll_buf["on"] = False
-                STATE.pop("vp_countdown", None)
-                hud.hide(token)
         threading.Thread(target=run, daemon=True).start()
 
     def enroll(self, _):
-        self._capture(
-            "enroll", VP_RECORD_SEC, "Запись отпечатка голоса",
-            f"После «ОК» говори {VP_RECORD_SEC} секунд обычным голосом, без "
-            "длинных пауз — читай любой текст вслух.\n\n"
-            "Пока идёт запись, у курсора видна капсула с уровнем звука, а в "
-            "меню-баре — обратный отсчёт. По итогу покажу, что получилось.\n\n"
-            f"Микрофон сейчас: {STATE['mic']}. Отпечаток привязан к микрофону — "
-            "для другого (например, AirPods) запиши заново на нём.")
+        self._vp_open("enroll")
 
     def vp_check_run(self, _):
-        self._capture(
-            "vpcheck", VP_CHECK_SEC, "Проверка голоса",
-            f"После «ОК» скажи фразу — {VP_CHECK_SEC} секунды.\n\n"
-            "Покажу, узнаю ли я тебя и с каким запасом до порога.")
+        self._vp_open("check")
 
     def refresh_recent(self, _):
         try:
