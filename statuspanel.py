@@ -135,12 +135,25 @@ def _layout(sections):
         _footer.bottomAnchor().constraintEqualToAnchor_constant_(content.bottomAnchor(), -m),
         _grid.trailingAnchor().constraintEqualToAnchor_constant_(content.trailingAnchor(), -m),
     ])
+    _fit()
+
+
+def _fit():
+    """Подогнать окно под содержимое, оставив верхний край на месте.
+
+    Нужен не только при пересборке: строка «Модели загружаются…» или длинное
+    имя микрофона переносится на две строки, и без пересчёта нижняя часть
+    обрезается."""
+    if _win is None:
+        return
+    content = _win.contentView()
     content.layoutSubtreeIfNeeded()
     size = content.fittingSize()
     old = _win.frame()
-    # растём/сжимаемся, оставляя верхний край на месте
     new_h = max(size.height, 200)
     new_w = max(size.width, 600)
+    if abs(new_h - old.size.height) < 1 and abs(new_w - old.size.width) < 1:
+        return
     _win.setFrame_display_(NSMakeRect(old.origin.x, old.origin.y + old.size.height - new_h,
                                       new_w, new_h), True)
 
@@ -148,7 +161,8 @@ def _layout(sections):
 _snapshot = None
 
 
-def show(snapshot, actions: dict, title="Dictate — состояние и разрешения"):
+def show(snapshot, actions: dict, title="Dictate — состояние и разрешения",
+         activate=True):
     """Открыть (или поднять) окно. snapshot() -> секции; actions: ключ -> callable."""
     global _win, _snapshot
     _snapshot = snapshot
@@ -161,11 +175,17 @@ def show(snapshot, actions: dict, title="Dictate — состояние и ра�
             NSMakeRect(0, 0, 900, 600), style, AppKit.NSBackingStoreBuffered, False)
         _win.setTitle_(title)
         _win.setReleasedWhenClosed_(False)
-        _win.setLevel_(AppKit.NSFloatingWindowLevel)  # поверх окна Настроек системы
+        # поверх других окон: окно ведёт пользователя в Настройки, и прятать
+        # его при уходе фокуса нельзя (мы — меню-бар без Dock, теряем фокус
+        # при каждом клике мимо). Закрывается крестиком.
+        _win.setLevel_(AppKit.NSFloatingWindowLevel)
         _win.center()
     refresh(force=True)
-    _win.makeKeyAndOrderFront_(None)
-    AppKit.NSApp.activateIgnoringOtherApps_(True)
+    if activate:
+        _win.makeKeyAndOrderFront_(None)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+    else:  # автопоказ при старте: не выдёргиваем пользователя из его окна
+        _win.orderFrontRegardless()
 
 
 def is_visible() -> bool:
@@ -185,6 +205,7 @@ def refresh(force=False):
         _apply(sections)
     else:
         _apply(sections)
+        _fit()  # текст мог стать выше/ниже — окно не должно резать содержимое
     if _footer is not None:
         _footer.setStringValue_("Обновлено " + time.strftime("%H:%M:%S")
                                 + " · окно можно закрыть, служба продолжит работать")

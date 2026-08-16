@@ -67,7 +67,7 @@ def system_sounds() -> list:
 BARS = 5
 _cfg = dict(DEFAULTS)
 _levels = []  # последние RMS-уровни (пишет аудиопоток, читает вью)
-_state = {"mode": None, "shown_at": 0.0}
+_state = {"mode": None, "token": None}
 
 
 def configure(cfg: dict):
@@ -99,63 +99,129 @@ _VOLUME = {"start": 0.55, "done": 0.45, "error": 0.30}
 _route = {"ts": 0.0, "uid": None, "reason": ""}
 
 
+_ca = None
+_cf = None
+
+
+def _coreaudio_libs():
+    """CoreAudio/CoreFoundation с объявленными типами (иначе ctypes режет
+    указатели до 32 бит на возвратах и статусы читаются как мусор)."""
+    global _ca, _cf
+    if _ca is None:
+        import ctypes
+        _ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+        _cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        _ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
+        _ca.AudioObjectGetPropertyDataSize.restype = ctypes.c_int32
+        _ca.AudioObjectAddPropertyListener.restype = ctypes.c_int32
+        _cf.CFStringGetCString.restype = ctypes.c_bool
+        _cf.CFRelease.argtypes = [ctypes.c_void_p]
+    return _ca, _cf
+
+
+def _fcc(x):
+    return int.from_bytes(x.encode(), "big")
+
+
 def _sound_route():
-    """UID устройства для звуков: None = дефолтный вывод, '' = не играть."""
+    """UID устройства для звуков: None = дефолтный вывод, '' = не играть.
+
+    Звук в Bluetooth-наушники переключает их профиль A2DP→HFP, и микрофон на
+    1–2 секунды отдаёт тишину — поэтому при BT-выводе играем во встроенный
+    динамик, а если его нет, молчим."""
+    import ctypes
     now = time.time()
     if now - _route["ts"] < 5.0:
         return _route["uid"]
     uid, reason = None, "вывод по умолчанию"
     try:
-        import ctypes
-        ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
-        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
-        cf.CFStringGetCString.restype = ctypes.c_bool
+        ca, cf = _coreaudio_libs()
 
         class Addr(ctypes.Structure):
             _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32),
                         ("element", ctypes.c_uint32)]
 
-        def fcc(x):
-            return int.from_bytes(x.encode(), "big")
-
         def size(obj, sel, scope="glob"):
-            a = Addr(fcc(sel), fcc(scope), 0)
+            a = Addr(_fcc(sel), _fcc(scope), 0)
             n = ctypes.c_uint32(0)
-            ca.AudioObjectGetPropertyDataSize(obj, ctypes.byref(a), 0, None, ctypes.byref(n))
+            if ca.AudioObjectGetPropertyDataSize(obj, ctypes.byref(a), 0, None,
+                                                 ctypes.byref(n)) != 0:
+                return 0
             return n.value
 
         def get(obj, sel, buf, scope="glob"):
-            a = Addr(fcc(sel), fcc(scope), 0)
+            a = Addr(_fcc(sel), _fcc(scope), 0)
             n = ctypes.c_uint32(ctypes.sizeof(buf))
             return ca.AudioObjectGetPropertyData(obj, ctypes.byref(a), 0, None,
                                                  ctypes.byref(n), ctypes.byref(buf))
 
         def cfstr(ref):
-            b = ctypes.create_string_buffer(256)
-            cf.CFStringGetCString(ref, b, 256, 0x08000100)
-            return b.value.decode()
+            if not ref.value:
+                return None
+            b = ctypes.create_string_buffer(512)
+            ok = cf.CFStringGetCString(ref, b, 512, 0x08000100)
+            cf.CFRelease(ref)  # правило Copy: строку освобождаем сами
+            return b.value.decode() if ok else None
 
         dout = ctypes.c_uint32()
-        get(1, "dOut", dout)
+        if get(1, "dOut", dout) != 0 or not dout.value:
+            raise OSError("нет устройства вывода по умолчанию")
         tt = ctypes.c_uint32()
-        get(dout.value, "tran", tt)
-        if tt.value == fcc("blue"):
+        if get(dout.value, "tran", tt) != 0:
+            raise OSError("не читается транспорт вывода")
+        if tt.value in (_fcc("blue"), _fcc("blea")):  # классический BT и BLE
             uid, reason = "", "вывод — Bluetooth, встроенного динамика нет"
             n = size(1, "dev#") // 4
-            ids = (ctypes.c_uint32 * n)()
-            get(1, "dev#", ids)
-            for d in ids:
-                t2 = ctypes.c_uint32()
-                get(d, "tran", t2)
-                if t2.value == fcc("bltn") and size(d, "stm#", "outp"):
-                    ref = ctypes.c_void_p()
-                    get(d, "uid ", ref)
-                    uid, reason = cfstr(ref), "вывод — Bluetooth, звуки во встроенный динамик"
-                    break
+            if n:
+                ids = (ctypes.c_uint32 * n)()
+                if get(1, "dev#", ids) == 0:
+                    for d in ids:
+                        t2 = ctypes.c_uint32()
+                        if get(d, "tran", t2) != 0 or t2.value != _fcc("bltn"):
+                            continue
+                        if not size(d, "stm#", "outp"):
+                            continue
+                        ref = ctypes.c_void_p()
+                        if get(d, "uid ", ref) != 0:
+                            continue
+                        name = cfstr(ref)
+                        if name:
+                            uid = name
+                            reason = "вывод — Bluetooth, звуки во встроенный динамик"
+                        break
     except Exception as e:  # noqa
         uid, reason = None, f"не определил вывод ({e})"
     _route.update(ts=now, uid=uid, reason=reason)
     return uid
+
+
+_route_listener_refs = []
+
+
+def watch_default_output():
+    """Смена устройства вывода сбрасывает кэш маршрута немедленно: иначе после
+    подключения AirPods звук ещё 5 секунд уходит в них и рвёт микрофон."""
+    import ctypes
+    try:
+        ca, _ = _coreaudio_libs()
+
+        class Addr(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32),
+                        ("element", ctypes.c_uint32)]
+
+        proto = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_uint32, ctypes.c_uint32,
+                                 ctypes.c_void_p, ctypes.c_void_p)
+
+        def _cb(obj, n, addrs, ctx):
+            _route["ts"] = 0.0
+            return 0
+
+        addr = Addr(_fcc("dOut"), _fcc("glob"), 0)
+        cb = proto(_cb)
+        _route_listener_refs.extend([cb, addr])
+        ca.AudioObjectAddPropertyListener(1, ctypes.byref(addr), cb, None)
+    except Exception as e:  # noqa
+        print(f"  слежение за выводом звука не включилось: {e}", flush=True)
 
 
 def sound_route_info() -> str:
@@ -200,19 +266,31 @@ def _caret_rect_appkit():
     try:
         import ApplicationServices as AS
         sysw = AS.AXUIElementCreateSystemWide()
+        # AX-запрос — синхронный вызов в чужой процесс: подвисшее приложение
+        # иначе держит главный поток секундами на каждом показе капсулы
+        try:
+            AS.AXUIElementSetMessagingTimeout(sysw, 0.25)
+        except Exception:
+            pass
         err, el = AS.AXUIElementCopyAttributeValue(sysw, AS.kAXFocusedUIElementAttribute, None)
         if err or el is None:
             return None
+        try:
+            AS.AXUIElementSetMessagingTimeout(el, 0.25)
+        except Exception:
+            pass
         err, rng = AS.AXUIElementCopyAttributeValue(el, AS.kAXSelectedTextRangeAttribute, None)
         if err or rng is None:
             return None
         values = [rng]
-        try:  # пустое выделение у некоторых полей не отдаёт границы — пробуем длину 1
+        try:  # пустое выделение у части полей не отдаёт границы — пробуем длину 1
             ok, r = AS.AXValueGetValue(rng, AS.kAXValueCFRangeType, None)
-            if ok and r.length == 0:
-                v1 = AS.AXValueCreate(AS.kAXValueCFRangeType, (r.location, 1))
-                if v1 is not None:
-                    values.append(v1)
+            loc, ln = (r[0], r[1]) if ok and r is not None else (None, None)
+            if loc is not None and ln == 0:
+                for cand in ((loc, 1), (max(0, loc - 1), 1)):  # символ справа/слева
+                    v1 = AS.AXValueCreate(AS.kAXValueCFRangeType, cand)
+                    if v1 is not None:
+                        values.append(v1)
         except Exception:
             pass
         rect = None
@@ -229,7 +307,10 @@ def _caret_rect_appkit():
         if rect is None:
             return None
         # AX: начало координат — левый верхний угол главного экрана, ось Y вниз
-        primary = AppKit.NSScreen.screens()[0].frame()
+        screens = AppKit.NSScreen.screens()
+        if not screens:
+            return None
+        primary = screens[0].frame()
         x = rect.origin.x
         y = primary.size.height - rect.origin.y - rect.size.height
         return NSMakeRect(x, y, max(2.0, rect.size.width), rect.size.height)
@@ -238,14 +319,17 @@ def _caret_rect_appkit():
 
 
 def _screen_for_point(x, y):
-    for s in AppKit.NSScreen.screens():
+    screens = AppKit.NSScreen.screens() or []
+    for s in screens:
         if AppKit.NSPointInRect((x, y), s.frame()):
             return s
-    return AppKit.NSScreen.mainScreen() or AppKit.NSScreen.screens()[0]
+    return AppKit.NSScreen.mainScreen() or (screens[0] if screens else None)
 
 
 def _target_frame(w, h):
     caret = _caret_rect_appkit() if _cfg["hud_pos"] == "caret" else None
+    if caret is not None and _screen_for_point(caret.origin.x, caret.origin.y) is None:
+        caret = None
     if caret is not None:
         scr = _screen_for_point(caret.origin.x, caret.origin.y)
         vis = scr.visibleFrame()
@@ -255,7 +339,10 @@ def _target_frame(w, h):
             y = caret.origin.y - h - 8
     else:
         loc = AppKit.NSEvent.mouseLocation()
-        vis = _screen_for_point(loc.x, loc.y).visibleFrame()
+        scr = _screen_for_point(loc.x, loc.y)
+        if scr is None:
+            return NSMakeRect(0, 0, w, h)
+        vis = scr.visibleFrame()
         x = vis.origin.x + vis.size.width / 2 - w / 2
         y = vis.origin.y + 56
     x = min(max(x, vis.origin.x + 6), vis.origin.x + vis.size.width - w - 6)
@@ -433,13 +520,14 @@ def _relayout():
     _panel.setFrame_display_(_target_frame(w, h), True)
 
 
-def _show_main(mode):
+def _show_main(mode, token):
     global _timer
     if not _cfg.get("hud", True):
         return
     _ensure_panel()
     first = _state["mode"] is None
     _state["mode"] = mode
+    _state["token"] = token
     if first:
         _levels.clear()
         _state["shown_at"] = time.time()
@@ -455,9 +543,12 @@ def _show_main(mode):
     _view.setNeedsDisplay_(True)
 
 
-def _hide_main():
+def _hide_main(token):
     global _timer
+    if token is not None and _state["token"] is not None and token != _state["token"]:
+        return  # прячут ЧУЖУЮ капсулу: пока распознавали, началась новая запись
     _state["mode"] = None
+    _state["token"] = None
     if _timer is not None:
         _timer.invalidate()
         _timer = None
@@ -465,23 +556,27 @@ def _hide_main():
         _panel.orderOut_(None)
 
 
-def show(mode: str = "rec"):
-    """Показать/переключить капсулу: 'rec' — запись, 'busy' — распознаю."""
-    AppHelper.callAfter(_show_main, mode)
+def show(mode: str = "rec", token=None):
+    """Показать/переключить капсулу: 'rec' — запись, 'busy' — распознаю.
+
+    token — номер записи: hide(token) спрячет капсулу, только если показывали
+    её для той же записи (иначе поздний hide гасит уже начатую следующую)."""
+    AppHelper.callAfter(_show_main, mode, token)
 
 
-def hide():
-    AppHelper.callAfter(_hide_main)
+def hide(token=None):
+    AppHelper.callAfter(_hide_main, token)
 
 
 def preview(seconds: float = 2.5):
     """Показать капсулу на пару секунд — для проверки настроек из меню."""
-    show("rec")
+    token = ("preview", time.time())
+    show("rec", token)
 
     def _fake():
         t0 = time.time()
         while time.time() - t0 < seconds:
             push_level(0.03 + 0.05 * abs(math.sin(time.time() * 3)))
             time.sleep(0.05)
-        hide()
+        hide(token)
     threading.Thread(target=_fake, daemon=True).start()

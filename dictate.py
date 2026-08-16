@@ -12,6 +12,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -36,8 +37,8 @@ HOTKEY = keyboard.Key.alt_r  # правый Option
 SAMPLE_RATE = 16000
 MIN_DURATION = 0.4  # сек; короче — случайное нажатие, игнорируем
 
-STATE = {"loading": True, "mic": "…", "enhance": True, "app": "",
-         "perms": {}, "last_hotkey": 0.0, "started": time.time()}
+STATE = {"loading": True, "mic": "…", "enhance": True, "app": "", "error": "",
+         "perms": {}, "last_hotkey": 0.0, "started": time.time(), "perms_ts": 0.0}
 
 ROLES = {  # роль -> (заголовок раздела, [(HF-репозиторий, ~полный размер МБ, подпись)])
     "asr": ("Распознавание", [
@@ -77,26 +78,61 @@ STYLES = {  # ключ -> подпись в меню
     "translate": "Перевод → EN",
 }
 CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
-          "translate_all": False, "vp_threshold": 0.40,
+          "translate_all": False, "vp_threshold": 0.40, "enhance": True,
           "asr_model": ASR_MODEL, "llm_model": LLM_MODEL,
           **hud.DEFAULTS}  # индикатор записи и звуки
 
 
 def load_config():
+    """Прочитать config.json поверх дефолтов, отбросив мусор.
+
+    Битый/частичный конфиг не должен ронять приложение: тип каждого значения
+    сверяем с дефолтом, неизвестный стиль профиля выкидываем."""
     global ASR_MODEL, LLM_MODEL
+    defaults = dict(CONFIG)
     try:
         with open(CONFIG_PATH) as f:
-            CONFIG.update(json.load(f))
-    except (FileNotFoundError, ValueError):
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("config.json — не объект")
+        for key, val in data.items():
+            ref = defaults.get(key)
+            if ref is not None and not isinstance(val, type(ref)) and not (
+                    isinstance(ref, (int, float)) and isinstance(val, (int, float))):
+                print(f"  config: «{key}» неверного типа — беру дефолт", flush=True)
+                continue
+            CONFIG[key] = val
+    except FileNotFoundError:
         pass
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        print(f"  config.json не прочитан ({e}) — работаю на дефолтах", flush=True)
+    if not isinstance(CONFIG.get("profiles"), dict):
+        CONFIG["profiles"] = {}
+    CONFIG["profiles"] = {a: st for a, st in CONFIG["profiles"].items()
+                          if isinstance(a, str) and st in STYLES}
+    if CONFIG.get("default_style") not in STYLES:
+        CONFIG["default_style"] = "clean"
+    for role, cfg_key in ROLE_CFG.items():
+        if not isinstance(CONFIG.get(cfg_key), str) or "/" not in CONFIG[cfg_key]:
+            CONFIG[cfg_key] = defaults[cfg_key]
     ASR_MODEL = CONFIG["asr_model"]
     LLM_MODEL = CONFIG["llm_model"]
+    STATE["enhance"] = bool(CONFIG["enhance"])
     hud.configure(CONFIG)
 
 
 def save_config():
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(CONFIG, f, ensure_ascii=False, indent=2)
+    # атомарно: обрыв на записи не должен оставить битый JSON (иначе при старте
+    # слетают модели и снова спрашивается первая закачка)
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(CONFIG, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
+    except OSError as e:
+        print(f"  не сохранил config.json: {e}", flush=True)
 
 
 def _dir_size_mb(path: str) -> float:
@@ -133,7 +169,22 @@ def _repo_status(repo: str, full_mb) -> dict:
     incomplete = [p for p in glob.glob(os.path.join(d, "blobs", "*.incomplete"))
                   if time.time() - os.path.getmtime(p) < 300]
     snaps = glob.glob(os.path.join(d, "snapshots", "*", "*"))
-    state = "loading" if incomplete else ("done" if snaps else "none")
+    # «скачана» — только если на месте веса и конфиг: HF кладёт симлинки по мере
+    # загрузки, и прерванная закачка иначе выглядит готовой (а падает при старте)
+    names = {os.path.basename(x) for x in snaps}
+    has_weights = any(n.endswith((".safetensors", ".npz", ".bin", ".gguf"))
+                      for n in names)
+    has_cfg = any(n in ("config.json", "params.json") or n.endswith(".json")
+                  for n in names)
+    complete = has_weights and has_cfg
+    if incomplete:
+        state = "loading"
+    elif complete:
+        state = "done"
+    elif snaps:
+        state = "partial"
+    else:
+        state = "none"
     return {"path": d, "state": state, "mb": _dir_size_mb(d), "full": full_mb}
 
 
@@ -143,6 +194,8 @@ def _model_row(label: str, st: dict, active: bool) -> str:
         size = _fmt_mb(st["mb"])
     elif st["state"] == "loading":
         size = f"⏳ {_fmt_mb(st['mb'])} из ~{_fmt_mb(st['full'])}"
+    elif st["state"] == "partial":
+        size = f"⚠️ скачана частично ({_fmt_mb(st['mb'])} из ~{_fmt_mb(st['full'])})"
     else:
         size = f"не скачана (~{_fmt_mb(st['full'])})"
     return f"{mark} {label} · {size}"
@@ -157,7 +210,8 @@ def style_for(app: str) -> str:
 recording = False
 chunks = []
 PREROLL_SEC = 0.5  # секунды звука ДО нажатия, подклеиваемые к записи
-preroll = collections.deque(maxlen=64)  # кольцевой буфер последних блоков микрофона
+preroll = collections.deque(maxlen=64)  # (время, блок) — последние блоки микрофона
+rec_seq = [0]  # номер текущей записи: капсулу прячет только «своя» диктовка
 lock = threading.Lock()
 jobs = queue.Queue()  # аудио -> единственный ML-поток (MLX не переживает смену потока)
 stream_holder = {}  # текущий InputStream; пересоздаётся при смене устройства/тишине
@@ -208,75 +262,156 @@ def probe_rms(device) -> float:
 SKIP_MICS = ("NoMachine",)  # виртуальные/нежелательные устройства в запасном выборе
 
 
+class NoMicrophone(Exception):
+    """В системе нет ни одного пригодного входа (Mac Studio без встроенного
+    микрофона, AirPods в кейсе). Не ошибка — просто ждём появления."""
+
+
+def usable_inputs() -> list:
+    """(индекс, устройство) — реальные входы, без виртуальных адаптеров."""
+    try:
+        devs = list(enumerate(sd.query_devices()))
+    except Exception:
+        return []
+    return [(i, d) for i, d in devs
+            if d["max_input_channels"] > 0
+            and not any(x in d["name"] for x in SKIP_MICS)]
+
+
 def _default_input(retries=6, delay=0.4):
     """Вход по умолчанию. При смене BT-профиля (A2DP↔HFP) устройство на миг
     исчезает и запрос падает с «device -1» — пробуем несколько раз,
     перечитывая список устройств между попытками."""
-    for i in range(retries):
-        try:
-            return sd.query_devices(kind="input")
-        except Exception:
-            if i == retries - 1:
-                raise
-            time.sleep(delay)
+    with reopen_lock:
+        for i in range(retries):
             try:
-                sd._terminate(); sd._initialize()
+                return sd.query_devices(kind="input")
             except Exception:
-                pass
+                if i == retries - 1:
+                    raise
+                time.sleep(delay)
+                _pa_recycle()
 
 
 def pick_device():
     """Доверяем системному входу по умолчанию (macOS сам переключает при AirPods
     в кейсе). Пробуем его несколько раз — Bluetooth-микрофон просыпается не сразу.
-    Если он всё же мёртв — предпочитаем ВСТРОЕННЫЙ микрофон, а не Continuity-iPhone."""
-    default = _default_input()
-    default_idx = default["index"]
-    for _ in range(4):  # ~1.4 c на пробуждение BT-микрофона
-        if probe_rms(default_idx) > 1e-5:
-            return default_idx, default["name"], True
-    devs = list(enumerate(sd.query_devices()))
+    Если он всё же мёртв — предпочитаем ВСТРОЕННЫЙ микрофон, а не Continuity-iPhone.
+
+    Если входа по умолчанию нет вовсе (Mac Studio, наушники в кейсе) —
+    NoMicrophone: вочдог перейдёт в тихое ожидание вместо циклов переоткрытия."""
+    try:
+        default = _default_input()
+    except Exception:
+        default = None  # «device -1»: система не знает входа по умолчанию
+    default_idx = default["index"] if default else None
+    if default is not None:
+        for _ in range(4):  # ~1.4 c на пробуждение BT-микрофона
+            if probe_rms(default_idx) > 1e-5:
+                return default_idx, default["name"], True
+    live = usable_inputs()
+    if not live and default is None:
+        raise NoMicrophone("нет входных устройств")
     # запасной приоритет: встроенный микрофон MacBook, потом остальные живые
-    builtin = [(i, d) for i, d in devs
-               if d["max_input_channels"] > 0 and "MacBook" in d["name"]]
-    for i, d in builtin:
-        if probe_rms(i) > 1e-5:
+    for i, d in live:
+        if "MacBook" in d["name"] and probe_rms(i) > 1e-5:
             return i, d["name"], False
     best_idx, best_name, best_rms = None, None, 0.0
-    for i, d in devs:
-        if (d["max_input_channels"] < 1 or i == default_idx
-                or any(s in d["name"] for s in SKIP_MICS)):
+    for i, d in live:
+        if i == default_idx:
             continue
         rms = probe_rms(i)
         if rms > max(best_rms, 1e-5):
             best_idx, best_name, best_rms = i, d["name"], rms
     if best_idx is not None:
         return best_idx, best_name, False
-    return default_idx, default["name"], True  # все молчат — остаёмся на дефолте
+    if default is not None:
+        return default_idx, default["name"], True  # все молчат — остаёмся на дефолте
+    i, d = live[0]  # вход есть, но молчит: откроем его, вочдог присмотрит
+    return i, d["name"], False
 
 
-reopen_lock = threading.Lock()  # переоткрытия идут из разных потоков (вотчер
-# смены входа, нажатие Option, вочдог); параллельные sd._terminate/_initialize
-# ломают PortAudio так, что все запросы устройств возвращают -1 до рестарта
+# Переоткрытия идут из разных потоков (вотчер смены входа, нажатие Option,
+# вочдог, стартовый open_stream): параллельные sd._terminate/_initialize ломают
+# PortAudio так, что все запросы устройств возвращают -1 до рестарта. RLock —
+# потому что reopen_stream зовёт open_stream, который берёт замок сам.
+class _ReopenLock:
+    """RLock, который умеет отвечать «сейчас переоткрывает ДРУГОЙ поток».
+
+    threading.RLock.locked() появился только в Python 3.14, а знать это нужно:
+    трогать PortAudio, пока другой поток делает _terminate/_initialize, — путь
+    к падению процесса."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._owner = None
+        self._depth = 0
+
+    def acquire(self, blocking=True):
+        got = self._lock.acquire(blocking)
+        if got:
+            self._owner = threading.get_ident()
+            self._depth += 1
+        return got
+
+    def release(self):
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+    def busy(self) -> bool:
+        return self._depth > 0 and self._owner != threading.get_ident()
+
+
+reopen_lock = _ReopenLock()
+_devices_cache = {"names": [], "ts": 0.0}  # для UI: без похода в PortAudio
+
+
+def _close_stream():
+    old = stream_holder.pop("stream", None)
+    if old:
+        try:
+            old.stop()
+            old.close()
+        except Exception:
+            pass
+
+
+def _pa_recycle():
+    """Перечитать список устройств CoreAudio. Только под reopen_lock!
+
+    Pa_Terminate закрывает все потоки и освобождает память — свой стрим
+    обязаны закрыть до этого, иначе последующий close() читает освобождённое."""
+    _close_stream()
+    try:
+        sd._terminate()
+    except Exception:
+        pass
+    try:
+        sd._initialize()
+    except Exception as e:
+        print(f"  PortAudio не переинициализировался: {e}", flush=True)
 
 
 def reopen_stream(follow_default=False):
     """Полный перезапуск аудио: закрыть поток, перечитать устройства CoreAudio, открыть заново."""
     with reopen_lock:
-        old = stream_holder.pop("stream", None)
-        if old:
-            try:
-                old.stop(); old.close()
-            except Exception:
-                pass
-        try:
-            sd._terminate(); sd._initialize()
-        except Exception:
-            pass
+        _pa_recycle()
         open_stream(follow_default=follow_default)
 
 
 def stream_alive() -> bool:
     """Поток открыт и колбэки идут (пульс не старше 2 с)."""
+    if reopen_lock.busy():
+        return False  # идёт переоткрытие: трогать закрываемый поток нельзя
     s = stream_holder.get("stream")
     try:
         return bool(s) and s.active and time.time() - stream_holder.get("last_cb", 0) < 2.0
@@ -288,32 +423,45 @@ def ensure_stream():
     """Перед записью: если поток умер или пульс пропал (микрофон отвалился) — переоткрыть."""
     if stream_alive():
         return
-    if reopen_lock.locked():
+    if reopen_lock.busy():
         return  # кто-то уже переоткрывает — не вставать в очередь
     print("  микрофон пропал — переоткрываю...", flush=True)
     try:
         # follow_default: без проб устройств, окно потери звука минимально;
         # если дефолт окажется мёртвым, сработает фолбэк по тихой записи
         reopen_stream(follow_default=True)
+    except NoMicrophone:
+        STATE["mic"] = "нет — подключи микрофон"
+        print("  микрофона нет — запись не пойдёт, подключи AirPods или USB-микрофон",
+              flush=True)
     except Exception as e:
         print(f"  не удалось открыть микрофон: {e}", flush=True)
 
 
 def open_stream(follow_default=False):
-    old = stream_holder.pop("stream", None)
-    if old:
-        old.stop()
-        old.close()
-    if follow_default:
-        # смена входа по умолчанию — это действие пользователя, верим без проб
-        d = _default_input()
-        dev, name, is_default = d["index"], d["name"], True
-    else:
-        dev, name, is_default = pick_device()
-    s = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                       device=dev, callback=audio_callback)
-    s.start()
-    stream_holder["stream"] = s
+    """Открыть входной поток. Замок берём сам: стартовый вызов из main() иначе
+    гонится с вотчером смены входа (AirPods переключают профиль при открытии)."""
+    with reopen_lock:
+        _close_stream()
+        if follow_default:
+            # смена входа по умолчанию — это действие пользователя, верим без проб
+            try:
+                d = _default_input(retries=2)
+                dev, name, is_default = d["index"], d["name"], True
+            except Exception:
+                dev, name, is_default = pick_device()  # дефолта нет — ищем сами
+        else:
+            dev, name, is_default = pick_device()
+        s = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                           device=dev, callback=audio_callback)
+        s.start()
+        stream_holder["stream"] = s
+        try:  # список входов для окна состояния — обновляем, пока PortAudio наш
+            _devices_cache["names"] = [d["name"] for d in sd.query_devices()
+                                       if d["max_input_channels"] > 0]
+            _devices_cache["ts"] = time.time()
+        except Exception:
+            pass
     note = "" if is_default else "  (вход по умолчанию молчит — взял живой)"
     STATE["mic"] = name
     print(f"Микрофон: {name}{note}", flush=True)
@@ -333,18 +481,20 @@ def stream_watchdog():
     waiting = False
     while True:
         time.sleep(min(30.0, 3.0 * (fails + 1)))
-        if recording or stream_alive() or reopen_lock.locked():
+        if recording or stream_alive() or reopen_lock.busy():
             fails = 0
             waiting = False
             continue
         with reopen_lock:  # перечитка списка устройств, сериализовано
+            _pa_recycle()
+            live = usable_inputs()
             try:
-                sd._terminate(); sd._initialize()
-                have_input = any(d["max_input_channels"] > 0
-                                 for d in sd.query_devices())
+                _devices_cache["names"] = [d["name"] for d in sd.query_devices()
+                                           if d["max_input_channels"] > 0]
+                _devices_cache["ts"] = time.time()
             except Exception:
-                have_input = True  # спросить не вышло — пробуем открыть как обычно
-        if not have_input:
+                pass
+        if not live:
             if not waiting:
                 print("  входных устройств нет (AirPods в кейсе?) — жду появления...",
                       flush=True)
@@ -356,6 +506,12 @@ def stream_watchdog():
         try:
             print("  поток мёртв — вочдог переоткрывает...", flush=True)
             reopen_stream()
+            fails = 0
+        except NoMicrophone:
+            if not waiting:
+                print("  микрофона нет — жду появления...", flush=True)
+                waiting = True
+            STATE["mic"] = "нет — подключи микрофон"
             fails = 0
         except Exception as e:
             fails += 1
@@ -403,9 +559,12 @@ def load_terms() -> str:
 
 
 def asr_hint() -> str:
-    # словарь в initial_prompt: Whisper подхватывает термины прямо при распознавании
+    """Словарь в initial_prompt: Whisper подхватывает термины при распознавании.
+
+    Служебных слов («Словарь:», «Глаголы:») в подсказке быть не должно — на
+    тихих записях Whisper выдаёт их эхом и они протекают в готовый текст."""
     terms = load_terms()
-    return f"Словарь: {terms}. Глаголы: задеплой, задеплоить." if terms else ""
+    return f"{terms}, задеплоить." if terms else ""
 
 
 def system_prompt() -> str:
@@ -462,24 +621,28 @@ def history_db() -> sqlite3.Connection:
 
 MAX_REC_SEC = 600  # предохранитель: забытый toggle не пишет вечно — авто-стоп и обработка
 rec_frames = [0]  # счётчик сэмплов текущей записи (под lock)
+overflow_sent = [False]  # авто-стоп ставится один раз на запись, а не на каждый колбэк
 
 def audio_callback(indata, frames, t, status):
-    stream_holder["last_cb"] = time.time()  # пульс: колбэки идут, пока устройство живо
+    now = time.time()
+    stream_holder["last_cb"] = now  # пульс: колбэки идут, пока устройство живо
     overflow = False
     with lock:
-        preroll.append(indata.copy())
+        preroll.append((now, indata.copy()))
         if recording:
             chunks.append(indata.copy())
             rec_frames[0] += len(indata)
             hud.push_level(float(np.sqrt((indata ** 2).mean())))
-            overflow = rec_frames[0] > MAX_REC_SEC * SAMPLE_RATE
-    if overflow and recording:
+            if rec_frames[0] > MAX_REC_SEC * SAMPLE_RATE and not overflow_sent[0]:
+                overflow_sent[0] = True
+                overflow = True
+    if overflow:
         print(f"  ⏱ запись дольше {MAX_REC_SEC // 60} мин — авто-стоп и обработка", flush=True)
         threading.Thread(target=stop_and_submit, daemon=True).start()
 
 
 FILLERS = re.compile(
-    r"\b(э+м*|а+м+|мда+|ну|короче|как бы|типа|это самое|в общем|значит)\b|\b[mм]\b",
+    r"\b(э+м*|а+м+|мда+|ну|короче|как бы|типа|это самое|в общем|значит)\b|(?<![\w'’])м(?![\w'’])",
     re.IGNORECASE)
 FILLER_WORDS = {"эээ", "эм", "ну", "короче", "типа", "мда", "м", "m", "как", "бы",
                 "это", "самое", "в", "общем", "значит", "а", "э"}
@@ -571,23 +734,35 @@ FORMAL_PROMPT_ADDON = (
 
 def ml_worker(ready: threading.Event):
     import torch
-    from silero_vad import load_silero_vad, get_speech_timestamps
-    vad = load_silero_vad(onnx=True)
-    from speechbrain.inference.speaker import EncoderClassifier
-    spk = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
-                                         savedir=os.path.join(BASE, "models/ecapa"))
-    ModelHolder.get_model(ASR_MODEL, mx.float16)
-    from mlx_lm import load, stream_generate
-    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
-    llm, tok = load(LLM_MODEL)
-    last_stats = {}  # заполняется llm_run: gen_tps, prompt_tps, gen_tokens
-    pcache = {"cache": make_prompt_cache(llm), "tokens": []}  # KV-кэш префикса промпта
+    try:
+        from silero_vad import load_silero_vad, get_speech_timestamps
+        vad = load_silero_vad(onnx=True)
+        from speechbrain.inference.speaker import EncoderClassifier
+        spk = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
+                                             savedir=os.path.join(BASE, "models/ecapa"))
+        ModelHolder.get_model(ASR_MODEL, mx.float16)
+        from mlx_lm import load, stream_generate
+        from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+        llm, tok = load(LLM_MODEL)
+        last_stats = {}  # заполняется llm_run: gen_tps, prompt_tps, gen_tokens
+        pcache = {"cache": make_prompt_cache(llm), "tokens": []}  # KV-кэш префикса промпта
 
-    for _ in stream_generate(llm, tok, prompt=tok.apply_chat_template(
-            [{"role": "user", "content": "ок"}], add_generation_prompt=True),
-            max_tokens=4):
-        pass  # прогрев, чтобы первая диктовка была быстрой
-    db = history_db()
+        for _ in stream_generate(llm, tok, prompt=tok.apply_chat_template(
+                [{"role": "user", "content": "ок"}], add_generation_prompt=True),
+                max_tokens=4):
+            pass  # прогрев, чтобы первая диктовка была быстрой
+        db = history_db()
+    except Exception as e:
+        # без моделей диктовать нечем: показываем причину в меню и окне
+        # состояния (иначе иконка вечно «⏳», а нажатия копятся в очереди)
+        STATE["error"] = f"модели не загрузились: {e}"
+        STATE["loading"] = False
+        print(f"✗ Модели не загрузились: {e}\n  Проверь сеть и «Модели» в меню; "
+              f"после починки — «Перезапустить» в окне состояния.", flush=True)
+        import traceback
+        traceback.print_exc()
+        ready.set()
+        return
     voiceprint = np.load(VOICEPRINT_PATH) if os.path.exists(VOICEPRINT_PATH) else None
     STATE["loading"] = False
     ready.set()
@@ -617,6 +792,9 @@ def ml_worker(ready: threading.Event):
             if x != y:
                 break
             common += 1
+        # хотя бы один токен должен уйти в генерацию: при полном совпадении
+        # (повторили ту же фразу) stream_generate с пустым промптом падает
+        common = min(common, len(prompt) - 1)
         try:
             if len(cached) > common:  # откатить кэш до общего префикса
                 trim_prompt_cache(cache, len(cached) - common)
@@ -661,16 +839,24 @@ def ml_worker(ready: threading.Event):
     rebuild_autodict()
 
     while True:
-        kind, audio = jobs.get()
+        kind, payload = jobs.get()
         if kind == "autodict":
             rebuild_autodict()
             continue
         if kind == "enroll":
-            nonlocal_vp = embed(audio)
-            np.save(VOICEPRINT_PATH, nonlocal_vp)
-            voiceprint = nonlocal_vp
-            print("Отпечаток голоса сохранён.", flush=True)
+            try:
+                nonlocal_vp = embed(payload)
+                if float(np.sqrt((payload ** 2).mean())) < 1e-4:
+                    print("  ✗ отпечаток не записан: было тихо, попробуй ещё раз",
+                          flush=True)
+                    continue
+                np.save(VOICEPRINT_PATH, nonlocal_vp)
+                voiceprint = nonlocal_vp
+                print("Отпечаток голоса сохранён.", flush=True)
+            except Exception as e:
+                print(f"  ✗ отпечаток не записан: {e}", flush=True)
             continue
+        audio, rec_app, token = payload
         ok = False
         try:
             duration = len(audio) / SAMPLE_RATE
@@ -743,12 +929,16 @@ def ml_worker(ready: threading.Event):
             if not raw:
                 continue
             # тихое аудио + initial_prompt => Whisper галлюцинирует куски словаря
-            raw_words = set(re.findall(r"\w+", raw.lower()))
+            raw_words = re.findall(r"\w+", raw.lower())
             hint_words = set(re.findall(r"\w+", asr_hint().lower()))
-            if raw_words and raw_words <= hint_words:
+            # эхо словаря — это перечисление НЕСКОЛЬКИХ терминов подряд на тихой
+            # записи; одиночный термин («задеплой», «ZeroTier») — нормальная
+            # диктовка, её раньше молча съедали
+            if (len(raw_words) >= 2 and set(raw_words) <= hint_words
+                    and len(set(raw_words)) >= 2):
                 print(f"  ✗ похоже на эхо словаря, не вставляю: {raw}", flush=True)
                 continue
-            app = frontmost_app()
+            app = rec_app or frontmost_app()
             style = style_for(app)
             text = raw
             t_llm = 0.0
@@ -792,9 +982,16 @@ def ml_worker(ready: threading.Event):
             rtf = duration / t_asr if t_asr else 0
             print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
                   f"llm {t_llm:.1f}s{speed} → {app}/{style}] {text}{mark}{doubt}", flush=True)
+        except Exception as e:
+            # любое необработанное исключение раньше убивало поток навсегда:
+            # иконка «готов», хоткей пишет, а текст не вставляется никогда
+            print(f"  ✗ ошибка обработки диктовки: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
         finally:
-            # обратная связь: капсула прячется, звук — вставили или отбросили
-            hud.hide()
+            # обратная связь: прячем капсулу ТОЛЬКО своей записи (пока шло
+            # распознавание, пользователь мог начать новую), звук — по итогу
+            hud.hide(token)
             hud.play("done" if ok else "error")
 
 
@@ -802,98 +999,117 @@ TAP_MAX = 0.35  # сек: короче — «тап» (toggle-режим), до�
 
 toggle_mode = False
 press_time = 0.0
-# длительность удержания меряем по времени события В ЯДРЕ (CGEventTimestamp, нс),
-# а не по моменту доставки колбэка: под нагрузкой MLX события приходят пачкой
-# с опозданием, и настоящее удержание выглядело как «тап» → ложный toggle-режим
 _RALT_MASK = 0x40  # NX_DEVICERALTKEYMASK — бит именно правого Option
-kernel_ts = {"press": 0, "release": 0}
-
-
-def _tap_intercept(event_type, event):
-    if event_type == Quartz.kCGEventFlagsChanged:
-        keycode = Quartz.CGEventGetIntegerValueField(
-            event, Quartz.kCGKeyboardEventKeycode)
-        if keycode == 61:  # правый Option
-            which = ("press" if Quartz.CGEventGetFlags(event) & _RALT_MASK
-                     else "release")
-            kernel_ts[which] = Quartz.CGEventGetTimestamp(event)
-    return event
 
 
 def stop_and_submit():
+    """Закончить запись и отдать аудио в ML-поток. Идемпотентна: авто-стоп по
+    таймеру и отпускание клавиши могут прийти одновременно."""
     global recording, toggle_mode
-    recording = False
-    toggle_mode = False
-    with lock:
-        if not chunks:
-            hud.hide()
+    with lock:  # снимаем флаг и забираем аудио атомарно, иначе новое нажатие
+        if not recording:  # (chunks.clear() в on_press) съедает готовую запись
             return
-        audio = np.concatenate(chunks).flatten().astype(np.float32)
+        recording = False
+        toggle_mode = False
+        audio = (np.concatenate(chunks).flatten().astype(np.float32)
+                 if chunks else np.zeros(0, dtype=np.float32))
+        spoken = rec_frames[0] / SAMPLE_RATE  # без приклеенного preroll
         chunks.clear()
-    if len(audio) / SAMPLE_RATE >= MIN_DURATION:
-        hud.show("busy")  # капсула: «распознаю…» до вставки/отказа
-        jobs.put(("dictate", audio))
+        token = rec_seq[0]
+    if spoken >= MIN_DURATION and len(audio):
+        hud.show("busy", token)  # капсула: «распознаю…» до вставки/отказа
+        # приложение-получатель фиксируем СЕЙЧАС: пока идёт распознавание,
+        # фронтальным может стать другое окно, и профиль/вставка уедут не туда
+        jobs.put(("dictate", (audio, frontmost_app(), token)))
     else:
-        hud.hide()
+        hud.hide(token)
 
 
 def cancel_recording():
     global recording, toggle_mode
-    recording = False
-    toggle_mode = False
     with lock:
+        recording = False
+        toggle_mode = False
         chunks.clear()
-    hud.hide()
+        token = rec_seq[0]
+    hud.hide(token)
     print("  ✗ запись отменена (Esc)", flush=True)
 
 
-def on_press(key):
+def start_recording():
     global recording, press_time
-    if key == keyboard.Key.esc and recording:
-        cancel_recording()
+    if STATE["loading"]:
+        # модели ещё греются: записанное всё равно вставится минут через
+        # несколько и не туда — честно отказываем сразу
+        print("  ⏳ модели ещё грузятся — диктовка будет доступна через несколько секунд",
+              flush=True)
+        hud.play("error")
         return
-    if key != HOTKEY:
-        return
-    if not recording:
-        # флаг записи — сразу, проверка/оживление потока — в фоне: колбэки начнут
-        # наполнять chunks в ту же миллисекунду, как поток жив
-        threading.Thread(target=ensure_stream, daemon=True).start()
-        with lock:
-            chunks.clear()
-            rec_frames[0] = 0
-            # подклеиваем последние PREROLL_SEC до нажатия — первое слово не режется,
-            # даже если начал говорить одновременно с клавишей
-            need = int(PREROLL_SEC * SAMPLE_RATE)
-            got = 0
-            for block in reversed(preroll):
-                chunks.insert(0, block)
-                got += len(block)
-                if got >= need:
-                    break
-        press_time = time.time()
-        STATE["last_hotkey"] = press_time
+    # флаг записи — сразу, проверка/оживление потока — в фоне: колбэки начнут
+    # наполнять chunks в ту же миллисекунду, как поток жив
+    threading.Thread(target=ensure_stream, daemon=True).start()
+    now = time.time()
+    with lock:
+        chunks.clear()
+        rec_frames[0] = 0
+        overflow_sent[0] = False
+        rec_seq[0] += 1
+        token = rec_seq[0]
+        # подклеиваем последние PREROLL_SEC до нажатия — первое слово не режется,
+        # даже если начал говорить одновременно с клавишей. Блоки старше секунды
+        # не берём: после мёртвого потока в буфере лежит речь минутной давности
+        need = int(PREROLL_SEC * SAMPLE_RATE)
+        got = 0
+        for ts, block in reversed(preroll):
+            if now - ts > 1.0:
+                break
+            chunks.insert(0, block)
+            got += len(block)
+            if got >= need:
+                break
         recording = True
-        hud.play("start")
-        hud.show("rec")
-        print("● запись...", flush=True)
-    elif toggle_mode:
-        stop_and_submit()  # второй тап — стоп
+    press_time = now
+    STATE["last_hotkey"] = now
+    hud.play("start")
+    hud.show("rec", token)
+    print("● запись...", flush=True)
+
+
+def on_press(key):
+    try:
+        if key == keyboard.Key.esc and recording:
+            cancel_recording()
+            return
+        if key != HOTKEY:
+            return
+        if not recording:
+            start_recording()
+        else:
+            # второй тап в toggle-режиме — стоп; в push-to-talk сюда попадаем,
+            # если отпускание потерялось (был зажат левый Option: macOS отдаёт
+            # общую маску Alternate) — тоже трактуем как стоп, иначе запись висит
+            if not toggle_mode:
+                print("  (отпускание не пришло — останавливаю по повторному нажатию)",
+                      flush=True)
+            stop_and_submit()
+    except Exception as e:  # исключение в колбэке останавливает слушателя клавиш
+        print(f"  ошибка обработки нажатия: {e}", flush=True)
 
 
 def on_release(key):
     global toggle_mode
-    if key != HOTKEY or not recording:
-        return
-    cb_hold = time.time() - press_time
-    k_hold = (kernel_ts["release"] - kernel_ts["press"]) / 1e9
-    hold = k_hold if 0 < k_hold < 3600 else cb_hold
-    lag = f" (колбэк {cb_hold:.2f}s)" if abs(cb_hold - hold) > 0.1 else ""
-    if hold < TAP_MAX:
-        toggle_mode = True  # короткий тап: пишем дальше до второго тапа или Esc
-        print(f"  … toggle-режим (тап {hold:.2f}s{lag}): говори, "
-              "ещё один тап Option — стоп, Esc — отмена", flush=True)
-    else:
-        stop_and_submit()  # классика: отпустил — обрабатываем
+    try:
+        if key != HOTKEY or not recording:
+            return
+        hold = time.time() - press_time
+        if hold < TAP_MAX:
+            toggle_mode = True  # короткий тап: пишем дальше до второго тапа или Esc
+            print(f"  … toggle-режим (тап {hold:.2f}s): говори, "
+                  "ещё один тап Option — стоп, Esc — отмена", flush=True)
+        else:
+            stop_and_submit()  # классика: отпустил — обрабатываем
+    except Exception as e:
+        print(f"  ошибка обработки отпускания: {e}", flush=True)
 
 
 class DictateApp(rumps.App):
@@ -951,7 +1167,7 @@ class DictateApp(rumps.App):
 
     def _boot_show_status(self, _):
         self._boot.stop()
-        self.open_status(None)
+        self.open_status(None, activate=False)  # при логине фокус не отбираем
 
     # --- индикатор записи и звуки -------------------------------------------
     def _build_hud_menu(self):
@@ -1027,8 +1243,8 @@ class DictateApp(rumps.App):
             hud.play("done")
 
     # --- окно состояния -------------------------------------------------------
-    def open_status(self, _):
-        statuspanel.show(self.status_snapshot, {
+    def open_status(self, _, activate=True):
+        statuspanel.show(self.status_snapshot, activate=activate, actions={
             "restart": restart_app,
             "log": lambda: self.open_log(None),
             "reopen": lambda: threading.Thread(target=reopen_stream, daemon=True).start(),
@@ -1051,17 +1267,27 @@ class DictateApp(rumps.App):
         self.download_model(it)
 
     def refresh_status(self, _):
-        # окно закрыто — снимок не собираем (в нём вызовы TCC/PortAudio)
+        # окно закрыто — снимок не собираем (в нём вызовы TCC/PortAudio),
+        # но сами разрешения перечитываем раз в 10 с, чтобы ⚠️ снималось
         if statuspanel.is_visible():
             statuspanel.refresh()
+        elif time.time() - STATE["perms_ts"] > 10:
+            STATE["perms_ts"] = time.time()
+            try:
+                perm_status()
+            except Exception:
+                pass
         issues = any(v != "ok" for v in STATE["perms"].values())
         self.status_item.title = ("⚠️ Состояние и разрешения…" if issues
                                   else "Состояние и разрешения…")
 
     def status_snapshot(self):
         perms = perm_status()
+        STATE["perms_ts"] = time.time()
         # --- служба ---
-        if STATE["loading"]:
+        if STATE["error"]:
+            svc = f"❌ {STATE['error']}"
+        elif STATE["loading"]:
             svc = ("⏳ Модели загружаются в память (после старта ~20–30 с, при первом "
                    "запуске — скачиваются)")
         elif recording:
@@ -1112,6 +1338,9 @@ class DictateApp(rumps.App):
             elif st["state"] == "loading":
                 txt, btn, act = (f"⏳ скачивается: {_fmt_mb(st['mb'])} из ~{_fmt_mb(full)} · {label}",
                                  None, None)
+            elif st["state"] == "partial":
+                txt, btn, act = (f"⚠️ скачана частично ({_fmt_mb(st['mb'])} из ~{_fmt_mb(full)}) · "
+                                 f"{label} — закачка обрывалась", "Докачать", f"dl:{role}")
             else:
                 txt, btn, act = (f"○ не скачана (~{_fmt_mb(full)}) · {label} — скачается при "
                                  f"первом запуске или по кнопке", "Скачать", f"dl:{role}")
@@ -1185,9 +1414,10 @@ class DictateApp(rumps.App):
                     rm = rumps.MenuItem("Удалить с диска", callback=self.delete_model)
                     rm._repo, rm._path = repo, st["path"]
                     row.add(rm)
-                elif st["state"] == "none":
-                    dl = rumps.MenuItem(f"Скачать (~{_fmt_mb(st['full'])})",
-                                        callback=self.download_model)
+                elif st["state"] in ("none", "partial"):
+                    dl = rumps.MenuItem(
+                        ("Докачать" if st["state"] == "partial" else "Скачать")
+                        + f" (~{_fmt_mb(st['full'])})", callback=self.download_model)
                     dl._repo = repo
                     row.add(dl)
                 else:
@@ -1213,12 +1443,17 @@ class DictateApp(rumps.App):
     def activate_model(self, sender):
         CONFIG[sender._cfg_key] = sender._repo
         save_config()
-        print(f"Активная модель теперь {sender._repo} — перезапускаюсь "
-              f"(launchd поднимет заново)...", flush=True)
-        rumps.quit_application()  # KeepAlive в plist перезапустит с новой моделью
+        print(f"Активная модель теперь {sender._repo} — перезапускаюсь...", flush=True)
+        restart_app()  # умеет и launchd, и запуск вручную (execv)
 
     def download_model(self, sender):
         repo = sender._repo
+        if not hasattr(self, "_downloading"):
+            self._downloading = set()
+        if repo in self._downloading:
+            return
+        self._downloading.add(repo)
+
         def dl():
             try:
                 from huggingface_hub import snapshot_download
@@ -1226,6 +1461,9 @@ class DictateApp(rumps.App):
                 print(f"Модель {repo} скачана.", flush=True)
             except Exception as e:
                 print(f"  модель {repo} не скачалась: {e}", flush=True)
+            finally:
+                self._downloading.discard(repo)
+                self._models_sig = ""
         threading.Thread(target=dl, daemon=True).start()
         self._models_sig = ""  # прогресс появится при следующем обновлении
 
@@ -1233,10 +1471,17 @@ class DictateApp(rumps.App):
         if sender._repo in (CONFIG["asr_model"], CONFIG["llm_model"]):
             rumps.alert("Модели", "Эта модель сейчас активна — сначала выбери другую.")
             return
+        if getattr(self, "_downloading", set()) & {sender._repo}:
+            rumps.alert("Модели", "Эта модель сейчас скачивается — дождись конца.")
+            return
         import shutil
-        shutil.rmtree(sender._path, ignore_errors=True)
-        print(f"Модель {sender._repo} удалена с диска.", flush=True)
-        self._models_sig = ""
+        repo, path = sender._repo, sender._path
+
+        def rm():  # rmtree на 17 ГБ в главном потоке морозит меню на секунды
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"Модель {repo} удалена с диска.", flush=True)
+            self._models_sig = ""
+        threading.Thread(target=rm, daemon=True).start()
 
     def open_model_dir(self, sender):
         path = sender._model_path
@@ -1245,14 +1490,22 @@ class DictateApp(rumps.App):
         subprocess.run(["open", path])
 
     def refresh_title(self, _):
-        # ⚠️ — поток мёртв/переоткрывается: жать Option рано, звук потеряется
-        self.title = ("⏳" if STATE["loading"] else "🟠" if recording
-                      else "🎙️" if stream_alive() else "⚠️")
-        self.mic_item.title = f"Микрофон: {STATE['mic']}"
+        # ❌ — модели не загрузились; ⚠️ — поток мёртв/переоткрывается
+        title = ("❌" if STATE["error"] else "⏳" if STATE["loading"]
+                 else "🟠" if recording else "🎙️" if stream_alive() else "⚠️")
+        if title != self.title:
+            self.title = title
+        mic = f"Микрофон: {STATE['mic']}"
+        if mic != self.mic_item.title:
+            self.mic_item.title = mic
         app = frontmost_app() or STATE["app"]
         STATE["app"] = app
         cur = CONFIG["profiles"].get(app)
-        self.profile.title = f"Профиль «{app}»: " + (STYLES[cur] if cur else "по умолчанию")
+        prof = f"Профиль «{app}»: " + (STYLES[cur] if cur else "по умолчанию")
+        if prof == getattr(self, "_prof_sig", None):
+            return  # приложение и стиль не менялись — галки трогать незачем
+        self._prof_sig = prof
+        self.profile.title = prof
         for it in self.profile.values():
             it.state = int((cur is None and it._style_key == "default") or it._style_key == cur)
         for it in self.default_style.values():
@@ -1290,27 +1543,36 @@ class DictateApp(rumps.App):
         rumps.alert("Отпечаток голоса",
                     "После ОК говори 5 секунд обычным голосом — любую фразу.")
         def rec():
-            a = sd.rec(int(5 * SAMPLE_RATE), samplerate=SAMPLE_RATE,
-                       channels=1, dtype="float32")
-            sd.wait()
-            jobs.put(("enroll", a.flatten().astype(np.float32)))
+            try:
+                with reopen_lock:  # параллельная проба устройства обрывает запись
+                    a = sd.rec(int(5 * SAMPLE_RATE), samplerate=SAMPLE_RATE,
+                               channels=1, dtype="float32")
+                    sd.wait()
+                jobs.put(("enroll", a.flatten().astype(np.float32)))
+            except Exception as e:
+                print(f"  ✗ отпечаток не записан: {e}", flush=True)
         threading.Thread(target=rec, daemon=True).start()
 
     def refresh_recent(self, _):
         try:
             db = sqlite3.connect(os.path.join(BASE, "history.sqlite3"))
-            rows = db.execute("SELECT text FROM transcriptions "
+            rows = db.execute("SELECT id, text FROM transcriptions "
                               "ORDER BY id DESC LIMIT 5").fetchall()
             db.close()
         except Exception:
             return
+        if rows == getattr(self, "_recent_sig", None):
+            return  # ничего не добавилось — не перестраиваем открытое меню
+        self._recent_sig = rows
         self.recent.clear()
         if not rows:
             self.recent.add(rumps.MenuItem("пусто"))
             return
-        for (text,) in rows:
-            label = text if len(text) <= 60 else text[:57] + "…"
-            item = rumps.MenuItem(label, callback=self.copy_item)
+        for i, (_id, text) in enumerate(rows, 1):
+            body = text if len(text) <= 60 else text[:57] + "…"
+            # нумеруем: rumps держит пункты в словаре по заголовку, и две
+            # одинаковые фразы схлопывались в одну строку
+            item = rumps.MenuItem(f"{i}. {body}", callback=self.copy_item)
             item._full_text = text
             self.recent.add(item)
 
@@ -1320,6 +1582,8 @@ class DictateApp(rumps.App):
     def toggle_enhance(self, sender):
         STATE["enhance"] = not STATE["enhance"]
         sender.state = int(STATE["enhance"])
+        CONFIG["enhance"] = STATE["enhance"]  # иначе сбрасывается при рестарте
+        save_config()
 
     def open_terms(self, _):
         subprocess.run(["open", "-t", os.path.join(BASE, "terms.txt")])
@@ -1439,20 +1703,39 @@ def request_permissions():
         if st[n] == "ask" or n == "Универсальный доступ":
             request_permission(n, quiet=True)  # системные диалоги
     if denied:
-        print(f"  Диалог система уже не покажет ({', '.join(denied)}) — открываю "
-              f"Настройки и Finder. Добавь бинарник в список (перетаскиванием), "
-              f"включи галку и нажми «Перезапустить» в окне состояния.", flush=True)
-        reveal_binary()
-        open_privacy_pane(denied[0])
+        # Не чаще раза в 10 минут: с KeepAlive перезапуски сыпали бы окнами
+        marker = os.path.join(tempfile.gettempdir(), "dictate-perm-prompt")
+        recent = (os.path.exists(marker)
+                  and time.time() - os.path.getmtime(marker) < 600)
+        print(f"  Диалог система уже не покажет ({', '.join(denied)}). Добавь "
+              f"бинарник в список (перетаскиванием), включи галку и нажми "
+              f"«Перезапустить» в окне состояния.", flush=True)
+        if not recent:
+            try:
+                open(marker, "w").close()
+            except OSError:
+                pass
+            reveal_binary()
+            open_privacy_pane(denied[0])
     return missing
 
 
 def input_devices() -> list:
-    """Имена входных устройств, видимых PortAudio (без переинициализации)."""
-    try:
-        return [d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0]
-    except Exception:
-        return []
+    """Имена входных устройств для UI.
+
+    Опрос PortAudio параллельно с sd._terminate() в другом потоке — это не
+    исключение, а падение процесса, поэтому только под свободным замком;
+    иначе отдаём последний известный список."""
+    if reopen_lock.acquire(blocking=False):
+        try:
+            names = [d["name"] for d in sd.query_devices()
+                     if d["max_input_channels"] > 0]
+            _devices_cache["names"], _devices_cache["ts"] = names, time.time()
+        except Exception:
+            pass
+        finally:
+            reopen_lock.release()
+    return _devices_cache["names"]
 
 
 def restart_app():
@@ -1512,7 +1795,7 @@ def ask_first_download():
         cfg_key = ROLE_CFG[role]
         repo = CONFIG[cfg_key]
         full = next((f for r, f, _ in ROLES[role][1] if r == repo), 0)
-        if _repo_status(repo, full)["state"] != "none":
+        if _repo_status(repo, full)["state"] not in ("none", "partial"):
             continue  # уже на диске (или качается) — вопросов нет
         chosen = _choose_model_dialog(role)
         if chosen and chosen != repo:
@@ -1523,22 +1806,42 @@ def ask_first_download():
         ASR_MODEL, LLM_MODEL = CONFIG["asr_model"], CONFIG["llm_model"]
 
 
+def _open_stream_quiet():
+    """Стартовое открытие потока: отсутствие микрофона — не повод для трейсбека."""
+    try:
+        open_stream()
+    except NoMicrophone:
+        STATE["mic"] = "нет — подключи микрофон"
+        print("  микрофона нет (Mac Studio без встроенного, AirPods в кейсе?) — "
+              "жду появления...", flush=True)
+    except Exception as e:
+        print(f"  микрофон не открылся: {e} — вочдог попробует ещё раз", flush=True)
+
+
 def main():
     load_config()
     missing = request_permissions()
     ask_first_download()
     # окно состояния при старте: нет разрешений или активные модели ещё не на диске
     need_dl = any(_repo_status(CONFIG[ROLE_CFG[r]], 0)["state"] != "done" for r in ROLES)
+    for role, cfg_key in ROLE_CFG.items():  # автоподхват докачки после обрыва
+        st = _repo_status(CONFIG[cfg_key], 0)["state"]
+        if st == "partial":
+            print(f"  модель {CONFIG[cfg_key]} скачана не полностью — докачаю при "
+                  f"загрузке (или кнопкой «Докачать» в окне состояния)", flush=True)
     STATE["show_status_on_start"] = bool(missing) or need_dl
     print(f"Прогреваю модели ({ASR_MODEL.split('/')[-1]} + {LLM_MODEL.split('/')[-1]})...")
     ready = threading.Event()
     threading.Thread(target=ml_worker, args=(ready,), daemon=True).start()
-    threading.Thread(target=open_stream, daemon=True).start()
+    threading.Thread(target=_open_stream_quiet, daemon=True).start()
+    hud.watch_default_output()  # AirPods подключили — звуки сразу мимо них
     threading.Thread(target=mic_watcher, daemon=True).start()
     threading.Thread(target=stream_watchdog, daemon=True).start()
     watch_default_input(mic_changed.set)
-    keyboard.Listener(on_press=on_press, on_release=on_release,
-                      darwin_intercept=_tap_intercept).start()
+    # без darwin_intercept: с ним pynput регистрирует блокирующий слушатель —
+    # каждое нажатие в системе ждёт наш Python-колбэк, и macOS отключает его по
+    # таймауту (хоткей переставал работать до перезапуска)
+    keyboard.Listener(on_press=on_press, on_release=on_release).start()
     print("Меню-бар запущен. Зажми правый Option и говори; отпусти — текст вставится.")
     DictateApp().run()
 

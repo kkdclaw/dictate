@@ -1,11 +1,11 @@
 [project]
 name = "dictate"
 version = "0.1.0"
-description = "Add your description here"
+description = "Локальная push-to-talk диктовка для macOS (Whisper + Qwen на MLX)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "gigaam",
+    "huggingface-hub>=1.24.0",   # кэш моделей, snapshot_download в меню «Модели»
     "mlx-lm>=0.31.3",
     "mlx-whisper>=0.4.3",
     "pynput>=1.8.2",
@@ -13,12 +13,11 @@ dependencies = [
     "pyobjc-framework-quartz>=12.2.1",
     "pyobjc-framework-webkit>=12.2.1",
     "rumps>=0.4.0",
+    "numpy>=2.4.0",
+    "onnxruntime>=1.23.2",       # Silero VAD в onnx-режиме (иначе тянулся транзитивно)
     "silero-vad>=6.2.1",
     "sounddevice>=0.5.5",
     "soundfile>=0.14.0",
     "speechbrain>=1.1.0",
     "torchaudio>=2.11.0",
 ]
-
-[tool.uv.sources]
-gigaam = { git = "https://github.com/salute-developers/GigaAM" }

@@ -255,7 +255,9 @@ def build(active="stats"):
 
     return PAGE.replace("__ACTIVE__", active) \
                .replace("__STATS__", stats_html) \
-               .replace("__DATA__", json.dumps(sd, ensure_ascii=False))
+               .replace("__DATA__", json.dumps(sd, ensure_ascii=False)
+                        # текст диктовки с «</script>» иначе рвёт страницу
+                        .replace("<", "\\u003c").replace(">", "\\u003e"))
 
 
 PAGE = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
