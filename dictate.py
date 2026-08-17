@@ -25,11 +25,13 @@ from mlx_whisper.transcribe import ModelHolder
 import mlx.core as mx
 from pynput import keyboard
 import Quartz
-from AppKit import NSWorkspace
+from AppKit import NSWorkspace, NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
 import webwindow
 import hud
 import statuspanel
 import enrollwindow
+import hotkey
+import hotkeywindow
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 # Семантическая версия. Держим синхронно с pyproject.toml и git-тегом vX.Y.Z:
@@ -37,11 +39,11 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
-HOTKEY = keyboard.Key.alt_r  # правый Option
+HK = hotkey.parse(hotkey.DEFAULT)  # горячая клавиша; перечитывается из config.json в load_config
 SAMPLE_RATE = 16000
 MIN_DURATION = 0.4  # сек; короче — случайное нажатие, игнорируем
 
@@ -92,6 +94,8 @@ STYLES = {  # ключ -> подпись в меню
 CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "translate_all": False, "vp_threshold": 0.40, "enhance": True,
           "asr_model": ASR_MODEL, "llm_model": LLM_MODEL,
+          "hotkey": hotkey.DEFAULT,      # см. hotkey.py: «alt_r», «fn», «ctrl+space», «cmd+shift+d»…
+          "restore_clipboard": True,     # после вставки вернуть в буфер то, что там лежало
           **hud.DEFAULTS}  # индикатор записи и звуки
 
 
@@ -139,7 +143,7 @@ def load_config():
 
     Битый/частичный конфиг не должен ронять приложение: тип каждого значения
     сверяем с дефолтом, неизвестный стиль профиля выкидываем."""
-    global ASR_MODEL, LLM_MODEL
+    global ASR_MODEL, LLM_MODEL, HK
     defaults = dict(CONFIG)
     try:
         with open(CONFIG_PATH) as f:
@@ -169,6 +173,14 @@ def load_config():
     ASR_MODEL = CONFIG["asr_model"]
     LLM_MODEL = CONFIG["llm_model"]
     STATE["enhance"] = bool(CONFIG["enhance"])
+    hk = hotkey.parse(CONFIG.get("hotkey"))
+    if hk is None:  # битая строка не должна оставить без диктовки
+        print(f"  config: hotkey «{CONFIG.get('hotkey')}» не разобран — правый Option",
+              flush=True)
+        CONFIG["hotkey"] = hotkey.DEFAULT
+        hk = hotkey.parse(hotkey.DEFAULT)
+    CONFIG["hotkey"] = hk.spec
+    HK = hk
     hud.configure(CONFIG)
 
 
@@ -650,13 +662,87 @@ def system_prompt() -> str:
     )
 
 
+PASTE_SETTLE = 0.6  # сек после ⌘V до возврата старого буфера: приложение должно
+# успеть прочитать наш текст (Electron/Qt читают буфер не мгновенно)
+PB_TRANSIENT = "org.nspasteboard.TransientType"  # менеджеры буфера (Maccy, Paste…)
+# такое не запоминают — диктовка не засоряет их историю
+_paste_lock = threading.Lock()  # снимок → вставка → возврат: следующая вставка ждёт
+
+
+def _pb_snapshot(pb) -> list:
+    """Всё содержимое буфера — по элементам и типам (картинка, файлы, RTF, не
+    только текст), чтобы вернуть ровно то, что было."""
+    items = []
+    for item in (pb.pasteboardItems() or []):
+        entry = []
+        for t in (item.types() or []):
+            try:
+                data = item.dataForType_(t)
+            except Exception:
+                data = None
+            if data is not None:
+                entry.append((t, data))
+        if entry:
+            items.append(entry)
+    return items
+
+
+def _pb_restore(pb, items: list) -> None:
+    pb.clearContents()
+    if not items:
+        return
+    objs = []
+    for entry in items:
+        it = NSPasteboardItem.alloc().init()
+        for t, data in entry:
+            try:
+                it.setData_forType_(data, t)
+            except Exception:
+                pass  # экзотический тип не записался — остальные вернём
+        objs.append(it)
+    pb.writeObjects_(objs)
+
+
 def paste_text(text: str) -> None:
-    subprocess.run(["pbcopy"], input=text.encode())
-    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
-    for down in (True, False):
-        ev = Quartz.CGEventCreateKeyboardEvent(src, 9, down)  # 9 = kVK_ANSI_V
-        Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskCommand)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    """Положить текст в буфер, нажать ⌘V и (если включено) вернуть в буфер то,
+    что там было: диктовка не должна затирать скопированную ссылку/картинку.
+
+    Возврат — через PASTE_SETTLE в фоне, чтобы не задерживать звук «готово»;
+    замок отпускается там же, поэтому следующая вставка дождётся возврата.
+    Если за это время человек сам что-то скопировал (changeCount ушёл) —
+    ничего не трогаем: его копия важнее нашего снимка."""
+    _paste_lock.acquire()
+    keep = bool(CONFIG.get("restore_clipboard", True))
+    try:
+        pb = NSPasteboard.generalPasteboard()
+        saved = _pb_snapshot(pb) if keep else None
+        pb.clearContents()
+        pb.setString_forType_(text, NSPasteboardTypeString)
+        pb.setString_forType_("", PB_TRANSIENT)
+        change = pb.changeCount()
+        src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+        for down in (True, False):
+            ev = Quartz.CGEventCreateKeyboardEvent(src, 9, down)  # 9 = kVK_ANSI_V
+            Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskCommand)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    except Exception:
+        _paste_lock.release()
+        raise
+    if not keep:
+        _paste_lock.release()
+        return
+
+    def _restore_later():
+        try:
+            time.sleep(PASTE_SETTLE)
+            if pb.changeCount() != change:
+                return  # пользователь уже скопировал своё
+            _pb_restore(pb, saved)
+        except Exception as e:
+            print(f"  буфер обмена не восстановлен: {e}", flush=True)
+        finally:
+            _paste_lock.release()
+    threading.Thread(target=_restore_later, daemon=True).start()
 
 
 def frontmost_app() -> str:
@@ -1173,7 +1259,8 @@ TAP_MAX = 0.35  # сек: короче — «тап» (toggle-режим), до�
 
 toggle_mode = False
 press_time = 0.0
-_RALT_MASK = 0x40  # NX_DEVICERALTKEYMASK — бит именно правого Option
+hk_down = False        # хоткей-НЕмодификатор сейчас зажат: глушим автоповтор клавиши
+hk_capture = {"on": False, "cb": None, "held_vk": None}  # захват «своего сочетания» из меню
 
 
 def stop_and_submit():
@@ -1199,7 +1286,7 @@ def stop_and_submit():
         hud.hide(token)
 
 
-def cancel_recording():
+def cancel_recording(reason="Esc"):
     global recording, toggle_mode
     with lock:
         recording = False
@@ -1207,7 +1294,7 @@ def cancel_recording():
         chunks.clear()
         token = rec_seq[0]
     hud.hide(token)
-    print("  ✗ запись отменена (Esc)", flush=True)
+    print(f"  ✗ запись отменена ({reason})", flush=True)
 
 
 def start_recording():
@@ -1255,13 +1342,95 @@ def start_recording():
     print("● запись...", flush=True)
 
 
-def on_press(key):
+class KeyListener(keyboard.Listener):
+    """pynput не знает клавишу Fn/🌐 (код 63): её flagsChanged не находит маски в
+    его таблице, и он всегда зовёт on_release. Смотрим флаг SecondaryFn в самом
+    событии и зовём press/release правильно — иначе Fn хоткеем не сделать."""
+
+    def _handle_message(self, proxy, event_type, event, refcon, injected):
+        if (event_type == Quartz.kCGEventFlagsChanged and
+                Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                == hotkey.VK_FN):
+            flags = Quartz.CGEventGetFlags(event)
+            key = keyboard.KeyCode.from_vk(hotkey.VK_FN)
+            try:
+                if flags & Quartz.kCGEventFlagMaskSecondaryFn:
+                    self.on_press(key, injected)
+                else:
+                    self.on_release(key, injected)
+            finally:
+                self._flags = flags
+            return
+        super()._handle_message(proxy, event_type, event, refcon, injected)
+
+
+def _capture_press(vk, flags):
+    """Захват своего сочетания: нажали клавишу-немодификатор с модификаторами —
+    сразу принимаем; одиночный модификатор принимаем на отпускании (см.
+    _capture_release), если пока он был зажат, ничего другого не нажали."""
+    if vk == hotkey.SPECIAL_VK["esc"] and not (flags & hotkey.ALL_MODS):
+        _capture_end(None)
+        return
+    if vk in hotkey.MODIFIER_VKS:
+        hk_capture["held_vk"] = vk
+        hotkeywindow.update(hotkey.held_description(vk, flags))
+        return
+    hk_capture["held_vk"] = None  # модификатор был частью сочетания, а не хоткеем
+    spec = hotkey.spec_from_press(vk, flags)
+    if spec is None:
+        hotkeywindow.update(hotkey.held_description(vk, flags),
+                            "Так не годится: одиночная буква, цифра или пробел сработают "
+                            "при обычном наборе. Добавь модификатор или возьми F-клавишу.")
+        return
+    _capture_end(spec)
+
+
+def _capture_release(vk):
+    if vk is not None and vk == hk_capture["held_vk"]:
+        _capture_end(hotkey.MODIFIER_VKS[vk])
+
+
+def _capture_end(spec):
+    global hk_down
+    hk_capture["on"] = False
+    hk_capture["held_vk"] = None
+    cb = hk_capture["cb"]
+    if spec and not hotkey.parse(spec).is_modifier:
+        hk_down = True  # клавишу ещё держат: её автоповтор не должен начать запись
+    if spec is None:
+        hotkeywindow.close()
+        print("  захват сочетания отменён", flush=True)
+    else:
+        hotkeywindow.finish(hotkey.describe(spec), "Принято — уже работает.")
+        print(f"  горячая клавиша: {hotkey.describe(spec)} ({spec})", flush=True)
+    if cb:
+        cb(spec)
+
+
+def on_press(key, injected=False):
+    global hk_down
     try:
+        vk = hotkey.key_vk(key)
+        if hk_capture["on"]:
+            _capture_press(vk, hotkey.current_flags())
+            return
         if key == keyboard.Key.esc and recording:
             cancel_recording()
             return
-        if key != HOTKEY:
+        if not HK.matches(vk, hotkey.current_flags()):
+            # чужая клавиша, пока хоткей-модификатор удерживается: это было
+            # сочетание с ним (⌘C на правом Command, ⌥-символ), а не диктовка —
+            # тихо отменяем, иначе короткое удержание превратится в toggle-запись
+            # (injected — программные нажатия, в т.ч. наш же ⌘V от предыдущей
+            # диктовки: они не отменяют запись)
+            if (recording and not toggle_mode and HK.is_modifier and not injected
+                    and vk not in hotkey.MODIFIER_VKS and vk is not None):
+                cancel_recording(reason="клавиша использована как модификатор")
             return
+        if not HK.is_modifier:
+            if hk_down:
+                return  # автоповтор зажатой клавиши — не второй тап
+            hk_down = True
         if not recording:
             start_recording()
         else:
@@ -1276,20 +1445,34 @@ def on_press(key):
         print(f"  ошибка обработки нажатия: {e}", flush=True)
 
 
-def on_release(key):
-    global toggle_mode
+def on_release(key, injected=False):
+    global toggle_mode, hk_down
     try:
-        if key != HOTKEY or not recording:
+        vk = hotkey.key_vk(key)
+        if hk_capture["on"]:
+            _capture_release(vk)
+            return
+        if vk != HK.vk:
+            return
+        hk_down = False
+        if not recording:
             return
         hold = time.time() - press_time
         if hold < TAP_MAX:
             toggle_mode = True  # короткий тап: пишем дальше до второго тапа или Esc
             print(f"  … toggle-режим (тап {hold:.2f}s): говори, "
-                  "ещё один тап Option — стоп, Esc — отмена", flush=True)
+                  f"ещё один тап {HK.label} — стоп, Esc — отмена", flush=True)
         else:
             stop_and_submit()  # классика: отпустил — обрабатываем
     except Exception as e:
         print(f"  ошибка обработки отпускания: {e}", flush=True)
+
+
+def begin_hotkey_capture(on_done):
+    """Из меню: открыть окно и ждать сочетание; on_done(spec|None) — из потока слушателя."""
+    hk_capture.update(on=True, cb=on_done, held_vk=None)
+    hotkeywindow.show(HK.label, on_cancel=lambda: _capture_end(None))
+    print("  жду новое сочетание для диктовки…", flush=True)
 
 
 class DictateApp(rumps.App):
@@ -1320,12 +1503,18 @@ class DictateApp(rumps.App):
         self.status_item = rumps.MenuItem("Состояние и разрешения…", callback=self.open_status)
         self.perm_item = rumps.MenuItem("Настроить разрешения…", callback=self.open_perm_wizard)
         self.hud_menu = self._build_hud_menu()
+        self.hotkey_menu = self._build_hotkey_menu()
+        self.clip_item = rumps.MenuItem("Возвращать буфер обмена после вставки",
+                                        callback=self.toggle_restore_clipboard)
+        self.clip_item.state = int(CONFIG["restore_clipboard"])
 
         self.menu = [self.status_item, self.perm_item, self.mic_item, self.recent, None,
                      self.profile, self.default_style, self.translate_item, None,
                      self.voice_menu,
                      None,
+                     self.hotkey_menu,
                      self.enh_item,
+                     self.clip_item,
                      self.hud_menu,
                      self.models_menu,
                      rumps.MenuItem("Статистика…", callback=self.open_stats),
@@ -1435,6 +1624,81 @@ class DictateApp(rumps.App):
         return m
 
     # --- индикатор записи и звуки -------------------------------------------
+    # --- горячая клавиша ------------------------------------------------------
+    def _build_hotkey_menu(self):
+        m = rumps.MenuItem("Горячая клавиша")
+        self.hotkey_menu = m  # нужен раньше return: _sync_hotkey_menu меняет заголовок
+        self.hotkey_items = []
+        for spec, label in hotkey.PRESETS:
+            it = rumps.MenuItem(label, callback=self.set_hotkey_preset)
+            it._spec = spec
+            m.add(it)
+            self.hotkey_items.append(it)
+        m.add(None)
+        # строка «своё сочетание»: показывает текущее, если оно не из списка
+        self.hotkey_custom = rumps.MenuItem("Своё сочетание…", callback=self.capture_hotkey)
+        m.add(self.hotkey_custom)
+        m.add(rumps.MenuItem("Как это работает…", callback=self.hotkey_help))
+        self._sync_hotkey_menu()
+        return m
+
+    def _sync_hotkey_menu(self):
+        cur = CONFIG["hotkey"]
+        preset = False
+        for it in self.hotkey_items:
+            it.state = int(it._spec == cur)
+            preset = preset or it._spec == cur
+        self.hotkey_custom.title = ("Своё сочетание…" if preset
+                                    else f"Своё сочетание: {hotkey.describe(cur)}…")
+        self.hotkey_custom.state = int(not preset)
+        self.hotkey_menu.title = f"Горячая клавиша: {hotkey.describe(cur)}"
+
+    def _apply_hotkey(self, spec):
+        global HK
+        hk = hotkey.parse(spec)
+        if hk is None:
+            return
+        HK = hk
+        CONFIG["hotkey"] = hk.spec
+        save_config()
+        self._sync_hotkey_menu()
+        print(f"  горячая клавиша теперь: {hk.label} ({hk.spec})", flush=True)
+
+    def set_hotkey_preset(self, sender):
+        if recording:
+            stop_and_submit()
+        self._apply_hotkey(sender._spec)
+
+    def capture_hotkey(self, _):
+        if recording:
+            stop_and_submit()
+        if hk_capture["on"]:
+            return
+
+        def done(spec):  # из потока слушателя клавиш
+            if spec:
+                from PyObjCTools import AppHelper
+                AppHelper.callAfter(self._apply_hotkey, spec)
+        begin_hotkey_capture(done)
+
+    def hotkey_help(self, _):
+        rumps.alert("Горячая клавиша диктовки", (
+            f"Сейчас: {HK.label}.\n\n"
+            "Зажал — говоришь — отпустил: текст вставится. Короткий тап (<0.35 с) "
+            "включает запись до второго тапа; Esc — отмена.\n\n"
+            "Готовые варианты — в меню; «Своё сочетание…» ловит любое: одиночный "
+            "модификатор, F-клавишу или клавишу с модификаторами (⌃ Space, ⌘⇧ D). "
+            "Буквы запоминаются по физической кнопке — раскладка не важна.\n\n"
+            "Fn / 🌐: в Настройках → Клавиатура поставь «При нажатии клавиши 🌐» = "
+            "«Ничего не делать», иначе macOS будет открывать эмодзи. Сочетания вида "
+            "⌘C на выбранном модификаторе диктовку не запускают.\n\n"
+            f"В config.json это ключ hotkey (сейчас «{HK.spec}»)."))
+
+    def toggle_restore_clipboard(self, sender):
+        CONFIG["restore_clipboard"] = not CONFIG["restore_clipboard"]
+        save_config()
+        self.clip_item.state = int(CONFIG["restore_clipboard"])
+
     def _build_hud_menu(self):
         m = rumps.MenuItem("Индикатор и звуки")
         self.hud_on = rumps.MenuItem("Показывать капсулу при записи", callback=self.toggle_hud)
@@ -1523,6 +1787,7 @@ class DictateApp(rumps.App):
             "vp_check": lambda: self.vp_check_run(None),
             "update": lambda: self.update_clicked(None),
             "log": lambda: self.open_log(None),
+            "hotkey": lambda: self.capture_hotkey(None),
             "reopen": lambda: threading.Thread(target=reopen_stream, daemon=True).start(),
             "reveal": reveal_binary,
             "cache": lambda: subprocess.run(["open", os.path.dirname(_repo_dir("x/y"))]),
@@ -1609,6 +1874,10 @@ class DictateApp(rumps.App):
             ("Обновления", update_summary(),
              "Обновить и перезапустить" if has_upd else "Проверить сейчас", "update"),
             ("Процесс", f"PID {os.getpid()} · работает {upt} · {how}", "Лог…", "log"),
+            ("Горячая клавиша", f"{HK.label} · тап — запись до второго тапа, Esc — отмена"
+             + (" · буфер обмена возвращается после вставки"
+                if CONFIG["restore_clipboard"] else ""),
+             "Сменить…", "hotkey"),
         ]
         # --- разрешения ---
         icons = {"ok": "✅ выдано",
@@ -2583,8 +2852,8 @@ def main():
     # без darwin_intercept: с ним pynput регистрирует блокирующий слушатель —
     # каждое нажатие в системе ждёт наш Python-колбэк, и macOS отключает его по
     # таймауту (хоткей переставал работать до перезапуска)
-    keyboard.Listener(on_press=on_press, on_release=on_release).start()
-    print("Меню-бар запущен. Зажми правый Option и говори; отпусти — текст вставится.")
+    KeyListener(on_press=on_press, on_release=on_release).start()
+    print(f"Меню-бар запущен. Зажми {HK.label} и говори; отпусти — текст вставится.")
     DictateApp().run()
 
 
