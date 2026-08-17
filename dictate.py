@@ -32,6 +32,7 @@ import statuspanel
 import enrollwindow
 import hotkey
 import hotkeywindow
+import commands
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 # Семантическая версия. Держим синхронно с pyproject.toml и git-тегом vX.Y.Z:
@@ -39,7 +40,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -96,6 +97,7 @@ CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "asr_model": ASR_MODEL, "llm_model": LLM_MODEL,
           "hotkey": hotkey.DEFAULT,      # см. hotkey.py: «alt_r», «fn», «ctrl+space», «cmd+shift+d»…
           "restore_clipboard": True,     # после вставки вернуть в буфер то, что там лежало
+          "commands": True,              # голосовые команды и сниппеты (commands.py)
           **hud.DEFAULTS}  # индикатор записи и звуки
 
 
@@ -745,6 +747,140 @@ def paste_text(text: str) -> None:
     threading.Thread(target=_restore_later, daemon=True).start()
 
 
+# --- голосовые команды: действия -----------------------------------------------
+LAST_PASTE = {}  # text, raw, app, ts — для «отмени», «повтори», «переведи»
+UNDO_WINDOW = 300  # сек: старше — «отмени» не трогает (курсор давно не там)
+# в терминале строку чистит ⌃U (zsh: kill-whole-line, Claude Code тоже понимает);
+# ⌘→/⇧⌘← там ходят по табам или печатают мусор
+TERMINAL_APPS = {"iTerm2", "Terminal", "Warp", "kitty", "Alacritty", "Ghostty", "WezTerm",
+                 "Hyper", "Tabby"}
+VK = {"a": 0, "c": 8, "v": 9, "x": 7, "u": 32, "return": 36, "tab": 48, "delete": 51,
+      "esc": 53, "left": 123, "right": 124}
+FL = {"cmd": Quartz.kCGEventFlagMaskCommand, "shift": Quartz.kCGEventFlagMaskShift,
+      "alt": Quartz.kCGEventFlagMaskAlternate, "ctrl": Quartz.kCGEventFlagMaskControl}
+
+
+def _key(name: str, *mods: str, delay: float = 0.03) -> None:
+    """Нажать клавишу с модификаторами через HID-событие (как ⌘V при вставке)."""
+    flags = 0
+    for m in mods:
+        flags |= FL[m]
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    for down in (True, False):
+        ev = Quartz.CGEventCreateKeyboardEvent(src, VK[name], down)
+        Quartz.CGEventSetFlags(ev, flags)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    time.sleep(delay)
+
+
+def _visible_len(text: str) -> int:
+    """Сколько раз нажать ⌫, чтобы стереть text: комбинирующие знаки, селекторы
+    вариантов и ZWJ отдельными символами не считаются — macOS стирает графему."""
+    import unicodedata
+    n = 0
+    after_zwj = False
+    ri_open = False  # первая половина пары региональных индикаторов (флаг)
+    for ch in text:
+        o = ord(ch)
+        if ch == "\u200d":
+            after_zwj = True
+            continue
+        if after_zwj:  # 👨‍💻: символ после ZWJ — часть той же графемы
+            after_zwj = False
+            continue
+        if (unicodedata.category(ch) in ("Mn", "Me") or ch in "\ufe0f\ufe0e"
+                or 0x1F3FB <= o <= 0x1F3FF):  # тон кожи
+            continue
+        if 0x1F1E6 <= o <= 0x1F1FF:
+            if ri_open:
+                ri_open = False
+                continue
+            ri_open = True
+        n += 1
+    return n
+
+
+def _undo_last(app: str) -> int:
+    lp = LAST_PASTE
+    if not lp or lp.get("app") != app or time.time() - lp.get("ts", 0) > UNDO_WINDOW:
+        raise RuntimeError("нечего отменять: последняя вставка была не сюда или давно")
+    n = _visible_len(lp["text"])
+    for _ in range(n):
+        _key("delete", delay=0.004)
+    LAST_PASTE.clear()  # второе «отмени» не должно стирать чужой текст
+    return n
+
+
+def run_command(m, app: str, translate) -> str:
+    """Выполнить команду (не хвостовую часть текста — она вставляется раньше).
+    Возвращает строку для лога; исключение — команда не выполнена."""
+    cid = m.cid
+    if m.is_snippet:
+        paste_text(m.snippet)
+        LAST_PASTE.update(text=m.snippet, raw=m.snippet, app=app, ts=time.time())
+        return f"сниппет ({len(m.snippet)} симв.)"
+    if cid == "delete_line":
+        if app in TERMINAL_APPS:
+            _key("u", "ctrl")
+            return "строка стёрта (⌃U)"
+        _key("right", "cmd")
+        _key("left", "cmd", "shift")
+        _key("delete")
+        return "строка стёрта"
+    if cid == "undo":
+        return f"стёр последнюю вставку ({_undo_last(app)} симв.)"
+    if cid == "delete_word":
+        _key("delete", "alt")
+        return "слово стёрто"
+    if cid == "delete_all":
+        _key("a", "cmd")
+        _key("delete")
+        return "всё стёрто"
+    if cid == "select_all":
+        _key("a", "cmd")
+        return "выделено всё"
+    if cid == "repeat":
+        if not LAST_PASTE:
+            raise RuntimeError("нечего повторять")
+        paste_text(LAST_PASTE["text"])
+        LAST_PASTE["ts"] = time.time()
+        LAST_PASTE["app"] = app
+        return "повторил последнюю вставку"
+    if cid == "send":
+        _key("return")
+        return "Return"
+    if cid == "new_line":
+        _key("return", "shift")
+        return "перенос строки"
+    if cid == "paragraph":
+        _key("return", "shift")
+        _key("return", "shift")
+        return "абзац"
+    if cid in ("tab", "enter", "esc"):
+        _key({"tab": "tab", "enter": "return", "esc": "esc"}[cid])
+        return cid
+    if cid in ("copy", "cut", "paste"):
+        _key({"copy": "c", "cut": "x", "paste": "v"}[cid], "cmd")
+        return f"⌘{ {'copy': 'C', 'cut': 'X', 'paste': 'V'}[cid] }"
+    if cid == "translate":
+        lp = dict(LAST_PASTE)
+        if not lp:
+            raise RuntimeError("нечего переводить: сначала продиктуй")
+        out = translate(lp.get("raw") or lp["text"])
+        _undo_last(app)
+        paste_text(out)
+        LAST_PASTE.update(text=out, raw=lp.get("raw"), app=app, ts=time.time())
+        return f"перевёл последнюю вставку: {out}"
+    if cid.startswith("style_"):
+        st = cid[len("style_"):]
+        if st not in STYLES:
+            raise RuntimeError(f"неизвестный стиль {st}")
+        CONFIG["profiles"][app] = st
+        save_config()
+        return f"профиль {app} → {STYLES[st]}"
+    raise RuntimeError(f"неизвестная команда {cid}")
+
+
 def frontmost_app() -> str:
     try:
         return NSWorkspace.sharedWorkspace().frontmostApplication().localizedName()
@@ -1197,6 +1333,24 @@ def ml_worker(ready: threading.Event):
                 continue
             app = rec_app or frontmost_app()
             style = style_for(app)
+            translate = lambda s: llm_run(TRANSLATE_PROMPT, s, max_factor=3) or s
+            cmd = commands.match(raw) if CONFIG["commands"] else None
+            snippet_tail = None
+            if cmd and not cmd.head:  # вся фраза — команда: действие вместо вставки
+                try:
+                    what = run_command(cmd, app, translate)
+                except RuntimeError as e:
+                    print(f"  ⚡ команда «{cmd.phrase}» не выполнена: {e}", flush=True)
+                    continue
+                ok = True
+                print(f"  ⚡ команда «{cmd.phrase}» → {what}  [{app}]", flush=True)
+                continue
+            if cmd:  # хвостовая форма: текст до команды идёт обычным путём
+                raw = cmd.head
+                if cmd.is_snippet:
+                    snippet_tail = cmd.snippet
+                elif cmd.cid == "translate":
+                    style = "translate"
             text = raw
             t_llm = 0.0
             last_stats.clear()  # сбрасываем перед возможным запуском LLM
@@ -1222,8 +1376,20 @@ def ml_worker(ready: threading.Event):
                 text = text.rstrip(".")
             else:
                 text = strip_short_period(text)
+            if snippet_tail:  # «пиши на, моя почта» — одной вставкой
+                text = text + ("\n" if "\n" in snippet_tail else " ") + snippet_tail
             paste_text(text)
+            LAST_PASTE.update(text=text, raw=raw, app=app, ts=time.time())
             ok = True
+            if cmd and not cmd.is_snippet and cmd.cid != "translate":
+                # действие после вставки; пауза — чтобы Return не обогнал ⌘V в
+                # приложениях, которые читают буфер асинхронно
+                time.sleep(0.25)
+                try:
+                    what = run_command(cmd, app, translate)
+                    print(f"  ⚡ команда «{cmd.phrase}» → {what}", flush=True)
+                except RuntimeError as e:
+                    print(f"  ⚡ команда «{cmd.phrase}» не выполнена: {e}", flush=True)
             gen_tps = last_stats.get("gen_tps")
             gen_tokens = last_stats.get("gen_tokens")
             db.execute(
@@ -1507,12 +1673,19 @@ class DictateApp(rumps.App):
         self.clip_item = rumps.MenuItem("Возвращать буфер обмена после вставки",
                                         callback=self.toggle_restore_clipboard)
         self.clip_item.state = int(CONFIG["restore_clipboard"])
+        self.cmd_menu = rumps.MenuItem("Команды и сниппеты")
+        self.cmd_on = rumps.MenuItem("Голосовые команды включены", callback=self.toggle_commands)
+        self.cmd_on.state = int(CONFIG["commands"])
+        self.cmd_menu.add(self.cmd_on)
+        self.cmd_menu.add(rumps.MenuItem("Список команд…", callback=self.show_commands))
+        self.cmd_menu.add(rumps.MenuItem("Файл команд и сниппетов…", callback=self.open_commands))
 
         self.menu = [self.status_item, self.perm_item, self.mic_item, self.recent, None,
                      self.profile, self.default_style, self.translate_item, None,
                      self.voice_menu,
                      None,
                      self.hotkey_menu,
+                     self.cmd_menu,
                      self.enh_item,
                      self.clip_item,
                      self.hud_menu,
@@ -1693,6 +1866,22 @@ class DictateApp(rumps.App):
             "«Ничего не делать», иначе macOS будет открывать эмодзи. Сочетания вида "
             "⌘C на выбранном модификаторе диктовку не запускают.\n\n"
             f"В config.json это ключ hotkey (сейчас «{HK.spec}»)."))
+
+    def toggle_commands(self, sender):
+        CONFIG["commands"] = not CONFIG["commands"]
+        save_config()
+        self.cmd_on.state = int(CONFIG["commands"])
+
+    def show_commands(self, _):
+        rumps.alert("Голосовые команды", (
+            "Команда — вся фраза целиком («удали», «отправь») или хвост фразы: "
+            "«…текст, отправь» — текст вставится, потом выполнится действие "
+            "(помечено «и хвостом»). Внутри текста команды не ищутся.\n\n"
+            + commands.describe_all()
+            + "\n\nСвои формулировки и сниппеты — «Файл команд и сниппетов…»."))
+
+    def open_commands(self, _):
+        subprocess.run(["open", "-t", commands.ensure_file()])
 
     def toggle_restore_clipboard(self, sender):
         CONFIG["restore_clipboard"] = not CONFIG["restore_clipboard"]

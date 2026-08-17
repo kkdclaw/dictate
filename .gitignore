@@ -25,3 +25,6 @@ models/
 auto_terms.txt
 dashboard.html
 dashboard-*.html
+
+# личные сниппеты и формулировки команд
+commands.json

@@ -1,6 +1,6 @@
 [project]
 name = "dictate"
-version = "0.8.0"  # синхронно с VERSION в dictate.py и git-тегом vX.Y.Z
+version = "0.9.0"  # синхронно с VERSION в dictate.py и git-тегом vX.Y.Z
 description = "Локальная push-to-talk диктовка для macOS (Whisper + Qwen на MLX)"
 readme = "README.md"
 requires-python = ">=3.12"
