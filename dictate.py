@@ -40,7 +40,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -98,6 +98,7 @@ CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "hotkey": hotkey.DEFAULT,      # см. hotkey.py: «alt_r», «fn», «ctrl+space», «cmd+shift+d»…
           "restore_clipboard": True,     # после вставки вернуть в буфер то, что там лежало
           "commands": True,              # голосовые команды и сниппеты (commands.py)
+          "auto_check_updates": False,   # один git ls-remote через минуту после старта; ставить — только вручную
           **hud.DEFAULTS}  # индикатор записи и звуки
 
 
@@ -1722,8 +1723,15 @@ class DictateApp(rumps.App):
         self.ver_item = rumps.MenuItem(f"Версия {app_version()}",
                                        callback=self.copy_version)
         self.upd_item = rumps.MenuItem("Обновления: …", callback=self.update_clicked)
+        self.restart_item = rumps.MenuItem("Перезапустить службу", callback=self.restart_clicked)
+        self.autoupd_item = rumps.MenuItem("Проверять обновления при запуске",
+                                           callback=self.toggle_auto_check)
+        self.autoupd_item.state = int(bool(CONFIG.get("auto_check_updates")))
         m.add(self.ver_item)
         m.add(self.upd_item)
+        m.add(self.autoupd_item)
+        m.add(None)
+        m.add(self.restart_item)
         return m
 
     def refresh_about(self, _=None):
@@ -1731,24 +1739,47 @@ class DictateApp(rumps.App):
         if upd != self.upd_item.title:
             self.upd_item.title = upd
         # сама версия неизменна, но пометка «на диске новее» появляется после pull
-        stale = " · ⬆️ на диске новее, нужен перезапуск" if code_updated_on_disk() else ""
-        title = f"Версия {app_version()}{stale}"
+        stale = code_updated_on_disk()
+        title = f"Версия {app_version()}" + (" · ⬆️ на диске новее, нужен перезапуск" if stale else "")
         if title != self.ver_item.title:
             self.ver_item.title = title
+        rs = "⬆️ Перезапустить службу — на диске новее" if stale else "Перезапустить службу"
+        if rs != self.restart_item.title:
+            self.restart_item.title = rs
+
+    def restart_clicked(self, _):
+        if rumps.alert("Перезапуск Dictate",
+                       "Служба перезапустится через launchd; на пару секунд диктовка "
+                       "будет недоступна, модели прогреются заново.",
+                       ok="Перезапустить", cancel="Отмена") == 1:
+            restart_app()
+
+    def toggle_auto_check(self, _):
+        CONFIG["auto_check_updates"] = not CONFIG.get("auto_check_updates")
+        save_config()
+        self.autoupd_item.state = int(CONFIG["auto_check_updates"])
 
     def update_clicked(self, _):
         """Клик по строке обновлений: первый раз — спрашиваем GitHub, и если
-        нашлось новое, следующий клик предлагает поставить. Сама программа в
-        сеть не ходит — только по этой кнопке."""
+        нашлось новое, следующий клик показывает список изменений и предлагает
+        поставить. Сама программа в сеть не ходит — только по этой кнопке
+        (и, если включено, один раз при запуске)."""
         u = STATE.get("update") or {}
         if u.get("busy"):
             return  # запрос уже в полёте
-        if u.get("tag") or u.get("commits"):
+        if update_available(u):
             what = (f"версии {u['tag']}" if u.get("tag") else "свежих правок с main")
+            log = u.get("log") or []
+            shown = log[:12]
+            changes = ("\n".join(f"• {l}" for l in shown)
+                       + (f"\n… и ещё {len(log) - len(shown)}" if len(log) > len(shown) else "")
+                       ) if log else "(список изменений получить не удалось)"
             if rumps.alert("Обновление Dictate",
                            f"Сейчас: {app_version()}.\nДоступно обновление до {what}.\n\n"
-                           "Будет выполнено: git pull (только перемотка), при смене "
-                           "зависимостей — uv sync, затем перезапуск службы.\n"
+                           f"Что изменилось:\n{changes}\n\n"
+                           "Будет выполнено: git pull (только перемотка), проверка "
+                           "компиляции, при смене зависимостей — uv sync, затем перезапуск "
+                           "службы. Если новая версия не соберётся — откат на текущую.\n"
                            "Незакоммиченные правки не тронем — при их наличии откажусь.",
                            ok="Обновить", cancel="Позже") != 1:
                 return
@@ -1762,10 +1793,11 @@ class DictateApp(rumps.App):
             STATE["update"] = res
             if res.get("error"):
                 notify_ui("Обновление Dictate", f"Не смог спросить GitHub: {res['error']}")
-            elif res.get("tag") or res.get("commits"):
+            elif update_available(res):
                 notify_ui("Обновление Dictate",
                           f"Установлено: {app_version()}\nЕсть новое: {update_summary()}\n\n"
-                          "Нажми строку «Обновления» ещё раз, чтобы поставить.")
+                          "Нажми строку «Обновления» ещё раз — покажу список изменений "
+                          "и предложу поставить.")
             else:
                 notify_ui("Обновление Dictate",
                           f"Установлено: {app_version()}\nЭто последняя версия.")
@@ -2055,8 +2087,7 @@ class DictateApp(rumps.App):
         how = "демон launchd (com.kkd.dictate, автозапуск при входе)" if os.path.exists(plist) \
             else "вручную (без демона — после выхода не поднимется сам)"
         stale = " · ⬆️ на диске новее — перезапусти" if code_updated_on_disk() else ""
-        u = STATE.get("update") or {}
-        has_upd = bool(u.get("tag") or u.get("commits"))
+        has_upd = update_available()
         service = [
             ("Состояние", svc, "Перезапустить", "restart"),
             ("Версия", f"{self._version}{stale}", "Скопировать", "copy_version"),
@@ -2284,6 +2315,8 @@ class DictateApp(rumps.App):
         title = ("❌" if STATE["error"] else "⏳" if STATE["loading"]
                  else "🟠" if recording or enroll_buf["on"]
                  else "🎙️" if stream_alive() else "⚠️")
+        if title == "🎙️" and (update_available() or code_updated_on_disk()):
+            title = "🎙️⬆️"  # есть что поставить/перезапустить — см. «О программе»
         if title != self.title:
             self.title = title
         mic = f"Микрофон: {STATE['mic']}"
@@ -2851,7 +2884,8 @@ def code_updated_on_disk() -> bool:
 # Спрашиваем удалённый репозиторий через `git ls-remote`, а не через GitHub API:
 # работает по тому же SSH-ключу, что и push (лишних токенов не нужно), не ест
 # лимит API (60 запросов в час на IP) и не качает объекты — только список ссылок.
-# Проверка ТОЛЬКО по кнопке: фоновых походов в сеть у диктовки нет.
+# По умолчанию проверка ТОЛЬКО по кнопке; галка «Проверять при запуске» добавляет
+# ровно один такой запрос через минуту после старта. Установка — всегда вручную.
 
 
 def _semver(tag: str):
@@ -2859,15 +2893,46 @@ def _semver(tag: str):
     return tuple(int(x) for x in m.groups()) if m else None
 
 
+def _tool_env(connect_timeout: int = 5) -> dict:
+    """Окружение для git/uv из демона: launchd даёт куцый PATH без ~/.local/bin
+    (там uv) и /opt/homebrew/bin, а git не должен зависать на вопросах."""
+    home = os.path.expanduser("~")
+    extra = [f"{home}/.local/bin", f"{home}/.cargo/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+    path = os.environ.get("PATH", "")
+    for d in extra:
+        if d not in path.split(":"):
+            path = f"{path}:{d}" if path else d
+    return {**os.environ, "PATH": path, "GIT_TERMINAL_PROMPT": "0",
+            "GIT_SSH_COMMAND": f"ssh -o BatchMode=yes -o ConnectTimeout={connect_timeout}"}
+
+
+def _uv_bin() -> str | None:
+    """Где uv: PATH демона его обычно не содержит — смотрим в обычных местах."""
+    import shutil
+    for cand in ("uv", os.path.expanduser("~/.local/bin/uv"),
+                 os.path.expanduser("~/.cargo/bin/uv"), "/opt/homebrew/bin/uv",
+                 "/usr/local/bin/uv"):
+        found = shutil.which(cand)
+        if found:
+            return found
+    return None
+
+
+def update_available(u: dict | None = None) -> bool:
+    u = STATE.get("update") if u is None else u
+    return bool(u and (u.get("tag") or u.get("commits")))
+
+
 def check_update() -> dict:
-    """Что нового на GitHub. Ничего не скачивает и не меняет рабочую копию.
+    """Что нового на GitHub. Рабочую копию не меняет.
 
     {"tag": "0.6.0"} — вышел релиз новее нашего;
     {"commits": True} — на main есть коммиты, которых у нас нет (без нового тега);
     {"error": "…"} — не дотянулись (нет сети, ключ не загружен).
+    Если новое есть — делаем git fetch (объекты в .git, рабочая копия не тронута)
+    и кладём список коммитов в "log": его покажем перед кнопкой «Обновить».
     """
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-           "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=5"}
+    env = _tool_env(5)
     try:
         r = subprocess.run(["git", "-C", BASE, "ls-remote", "--tags", "--refs",
                             "--heads", "origin"], capture_output=True, text=True,
@@ -2896,7 +2961,37 @@ def check_update() -> dict:
                               capture_output=True)
         if have.returncode != 0:
             out["commits"] = True
+    if update_available(out):
+        out["log"] = _fetch_changelog(env)
     return out
+
+
+def _fetch_changelog(env: dict) -> list[str]:
+    """git fetch + список коммитов, которых у нас нет. Пусто — если не удалось."""
+    try:
+        f = subprocess.run(["git", "-C", BASE, "fetch", "--quiet", "--tags", "origin", "main"],
+                           capture_output=True, text=True, timeout=60, env=env)
+        if f.returncode != 0:
+            return []
+        lg = subprocess.run(["git", "-C", BASE, "log", "--no-merges", "--format=%h %s",
+                             "HEAD..origin/main"], capture_output=True, text=True,
+                            timeout=10, env=env)
+        return lg.stdout.strip().splitlines() if lg.returncode == 0 else []
+    except Exception:
+        return []
+
+
+def _compile_ok() -> str:
+    """Синтаксическая проверка всех .py в корне: битый релиз не должен уронить
+    демон в бесконечный перезапуск под KeepAlive. Возвращает текст ошибки или ''."""
+    import py_compile
+    for name in sorted(os.listdir(BASE)):
+        if name.endswith(".py"):
+            try:
+                py_compile.compile(os.path.join(BASE, name), doraise=True)
+            except py_compile.PyCompileError as e:
+                return str(e)[-300:]
+    return ""
 
 
 def apply_update() -> str:
@@ -2905,13 +3000,13 @@ def apply_update() -> str:
     Обновление НЕ автоматическое: приложение слушает клавиатуру и микрофон,
     подменять такой код без ведома хозяина нельзя. Тянем только быстрой
     перемоткой — если локально есть свои коммиты или правки, честно отказываем.
+    Перед перезапуском компилируем код; не собрался — откатываем на прежний коммит.
     """
     if _git("status", "--porcelain"):
         return ("В рабочей копии есть незакоммиченные правки — обновление отменено.\n"
                 "Сохрани или откати их (git stash), потом повтори.")
     before = _git("rev-parse", "HEAD")
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-           "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=10"}
+    env = _tool_env(10)
     r = subprocess.run(["git", "-C", BASE, "pull", "--ff-only", "--tags"],
                        capture_output=True, text=True, timeout=120, env=env)
     if r.returncode != 0:
@@ -2919,16 +3014,29 @@ def apply_update() -> str:
     after = _git("rev-parse", "HEAD")
     if before == after:
         return "Уже актуальная версия — обновлять нечего."
+
+    def rollback(reason: str) -> str:
+        subprocess.run(["git", "-C", BASE, "reset", "--hard", before],
+                       capture_output=True, timeout=30)
+        return (f"Новая версия {app_version_of(after)} не прошла проверку — откатил "
+                f"обратно на {app_version_of(before)}.\n\n{reason}")
+
+    err = _compile_ok()
+    if err:
+        return rollback(f"Код не компилируется:\n{err}")
     # поменялись зависимости — venv надо досинхронизировать, иначе новый код
     # упадёт на импорте отсутствующего пакета уже после перезапуска
     changed = _git("diff", "--name-only", before, after).splitlines()
     if {"pyproject.toml", "uv.lock"} & set(changed):
-        s = subprocess.run(["uv", "sync"], cwd=BASE, capture_output=True,
-                           text=True, timeout=600)
+        uv = _uv_bin()
+        if not uv:
+            return rollback("Зависимости изменились, а uv не найден (искал в PATH, "
+                            "~/.local/bin, ~/.cargo/bin, /opt/homebrew/bin).\n"
+                            "Поставь uv и повтори обновление.")
+        s = subprocess.run([uv, "sync"], cwd=BASE, capture_output=True,
+                           text=True, timeout=600, env=env)
         if s.returncode != 0:
-            return (f"Код обновлён до {app_version_of(after)}, но `uv sync` не прошёл:\n"
-                    f"{(s.stderr or s.stdout).strip()[-400:]}\n\n"
-                    "Выполни `uv sync` в ~/dictate вручную и перезапусти службу.")
+            return rollback(f"`uv sync` не прошёл:\n{(s.stderr or s.stdout).strip()[-400:]}")
     STATE["update"] = {"checked": time.time()}
     threading.Timer(1.5, restart_app).start()  # дать окну закрыться
     return (f"Обновлено до {app_version_of(after)}.\n"
@@ -2955,6 +3063,25 @@ def update_summary() -> str:
     if u.get("commits"):
         return "⬆️ есть свежие правки на main — нажми, чтобы обновить"
     return f"актуальная (проверено в {when})"
+
+
+def auto_check_updates_later(delay: float = 60.0):
+    """Опциональная проверка при запуске: один ls-remote после прогрева моделей.
+    Результат — только пометка ⬆️ в меню; ничего не ставится."""
+    if not CONFIG.get("auto_check_updates"):
+        return
+
+    def run():
+        time.sleep(delay)
+        if STATE.get("update"):  # уже проверяли вручную — не дёргаем сеть зря
+            return
+        STATE["update"] = {"busy": True}
+        STATE["update"] = check_update()
+        u = STATE["update"]
+        print("Проверка обновлений при запуске: "
+              + (f"ошибка — {u['error']}" if u.get("error") else update_summary()),
+              flush=True)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _choose_model_dialog(role: str) -> str | None:
@@ -3043,6 +3170,7 @@ def main():
     # таймауту (хоткей переставал работать до перезапуска)
     KeyListener(on_press=on_press, on_release=on_release).start()
     print(f"Меню-бар запущен. Зажми {HK.label} и говори; отпусти — текст вставится.")
+    auto_check_updates_later()  # выкл. по умолчанию; см. галку в «О программе»
     DictateApp().run()
 
 
