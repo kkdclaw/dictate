@@ -81,7 +81,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -1167,6 +1167,57 @@ FORMAL_PROMPT_ADDON = (
 )
 
 
+def fix_model_config(repo: str) -> list:
+    """Привести к float поля конфига модели, которые transformers объявляет
+    float, а автор модели записал целым. Возвращает список починенных полей.
+
+    Зачем: GigaChat3.1 приезжает с "routed_scaling_factor": 1, а transformers 5
+    со строгими датаклассами читать такое отказывается — модель не грузится
+    вовсе, и диктовка остаётся без LLM. Правим файл в кэше HF; если модель
+    когда-нибудь перекачается, оригинал вернётся и мы починим его снова."""
+    import dataclasses
+    try:
+        from huggingface_hub import snapshot_download
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        path = os.path.join(snapshot_download(repo, local_files_only=True), "config.json")
+        with open(path) as f:
+            data = json.load(f)
+        # только через [] — CONFIG_MAPPING это ленивый маппинг поверх OrderedDict,
+        # и .get() обходит ленивую загрузку, молча возвращая None на живой класс
+        try:
+            cls = CONFIG_MAPPING[data.get("model_type")]
+        except KeyError:
+            return []
+        floats = {f.name for f in dataclasses.fields(cls) if f.type in (float, "float")}
+        fixed = [k for k, v in data.items()
+                 if k in floats and isinstance(v, int) and not isinstance(v, bool)]
+        if not fixed:
+            return []
+        for k in fixed:
+            data[k] = float(data[k])
+        with open(path, "w") as f:  # пишем сквозь симлинк — структура кэша цела
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return fixed
+    except Exception as e:
+        print(f"  конфиг модели {repo} поправить не вышло: {e}", flush=True)
+        return []
+
+
+def load_llm(repo: str):
+    """Загрузка LLM с одной попыткой починить конфиг (см. fix_model_config)."""
+    from mlx_lm import load
+    try:
+        return load(repo)
+    except Exception as e:
+        fixed = fix_model_config(repo)
+        if not fixed:
+            raise
+        print(f"  конфиг {repo.split('/')[-1]}: поля {', '.join(fixed)} записаны "
+              f"целыми там, где нужен float ({e.__class__.__name__}) — привёл к "
+              f"float, пробую снова", flush=True)
+        return load(repo)
+
+
 def ml_worker(ready: threading.Event):
     import torch
     try:
@@ -1176,9 +1227,9 @@ def ml_worker(ready: threading.Event):
         spk = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
                                              savedir=os.path.join(BASE, "models/ecapa"))
         ModelHolder.get_model(ASR_MODEL, mx.float16)
-        from mlx_lm import load, stream_generate
+        from mlx_lm import stream_generate
         from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
-        llm, tok = load(LLM_MODEL)
+        llm, tok = load_llm(LLM_MODEL)
         last_stats = {}  # заполняется llm_run: gen_tps, prompt_tps, gen_tokens
         pcache = {"cache": make_prompt_cache(llm), "tokens": []}  # KV-кэш префикса промпта
 
@@ -1190,12 +1241,26 @@ def ml_worker(ready: threading.Event):
     except Exception as e:
         # без моделей диктовать нечем: показываем причину в меню и окне
         # состояния (иначе иконка вечно «⏳», а нажатия копятся в очереди)
+        import traceback
+        traceback.print_exc()
+        fallback = ROLES["llm"][1][0][0]  # первая в списке — модель по умолчанию
+        if CONFIG["llm_model"] != fallback:
+            # выбранная в меню модель не поехала: без отката диктовка мертва до
+            # ручного вмешательства, а человек уже ушёл работать. Петли не будет:
+            # если не поедет и дефолтная, откатывать уже не с чего
+            print(f"✗ Модель {CONFIG['llm_model'].split('/')[-1]} не загрузилась: {e}\n"
+                  f"  Возвращаю {fallback.split('/')[-1]} и перезапускаюсь.", flush=True)
+            CONFIG["llm_model"] = fallback
+            save_config()
+            notify_ui("Модель не загрузилась",
+                      f"{e}\n\nВернул модель по умолчанию "
+                      f"({fallback.split('/')[-1]}) и перезапускаю службу.")
+            restart_app()
+            return
         STATE["error"] = f"модели не загрузились: {e}"
         STATE["loading"] = False
         print(f"✗ Модели не загрузились: {e}\n  Проверь сеть и «Модели» в меню; "
               f"после починки — «Перезапустить» в окне состояния.", flush=True)
-        import traceback
-        traceback.print_exc()
         ready.set()
         return
     _vp = load_voiceprint()
