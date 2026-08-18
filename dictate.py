@@ -81,7 +81,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.12.0"
+VERSION = "0.12.1"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -721,9 +721,29 @@ def mic_watcher():
         mic_changed.clear()
 
 
+HINT_TOKENS = 210  # потолок initial_prompt — 224 токена; хвост asr_hint и зазор
+_whisper_tok = {}
+
+
+def tok_len(text: str) -> int:
+    """Длина текста в токенах Whisper (токенизатор грузим один раз)."""
+    try:
+        if "t" not in _whisper_tok:
+            from mlx_whisper.tokenizer import get_tokenizer
+            _whisper_tok["t"] = get_tokenizer(multilingual=True, language="ru",
+                                              task="transcribe")
+        return len(_whisper_tok["t"].encoding.encode(text))
+    except Exception:
+        return max(1, len(text) // 3)  # грубо, если токенизатор недоступен
+
+
 def load_terms() -> str:
-    # ручное ядро + автослой из истории; лимит ~60 слов (у initial_prompt Whisper
-    # потолок 224 токена), ручные — в приоритете
+    """Ручное ядро + автослой из истории, обрезанные по ТОКЕНАМ.
+
+    Раньше резалось по словам (60 штук), а у initial_prompt Whisper потолок в
+    224 ТОКЕНА, и одно русское слово — это 3–5 токенов: словарь из 58 слов
+    давал 227 токенов. Лишнее Whisper отрезает С НАЧАЛА, то есть выбрасывал
+    ровно ручные термины, которые важнее автослоя."""
     words, seen = [], set()
     for fname in ("terms.txt", "auto_terms.txt"):
         try:
@@ -735,9 +755,14 @@ def load_terms() -> str:
                         seen.add(w.lower())
         except FileNotFoundError:
             pass
-        if len(words) >= 60:
-            break
-    return ", ".join(words[:60])
+    out, total = [], 0
+    for w in words:
+        n = tok_len(", " + w)
+        if total + n > HINT_TOKENS:
+            break  # ручные идут первыми, поэтому обрезается хвост автослоя
+        out.append(w)
+        total += n
+    return ", ".join(out)
 
 
 
@@ -1646,6 +1671,16 @@ def ml_worker(ready: threading.Event):
                     and len(set(raw_words)) >= 2):
                 print(f"  ✗ похоже на эхо словаря, не вставляю: {raw}", flush=True)
                 continue
+            # зацикливание распознавания: одно слово подряд десятками раз.
+            # Мало того что это мусор во вставке — строка ложится в историю,
+            # автословарь тащит слово в initial_prompt, и Whisper выдаёт его
+            # снова (так в словаре оказались «secular» и «actresses»)
+            if len(raw_words) >= 8:
+                top, cnt = collections.Counter(raw_words).most_common(1)[0]
+                if cnt >= 8 and cnt >= len(raw_words) * 0.4:
+                    print(f"  ✗ распознавание зациклилось на «{top}» ({cnt} раз из "
+                          f"{len(raw_words)}) — не вставляю", flush=True)
+                    continue
             app = rec_app or frontmost_app()
             style = style_for(app)
             translate = lambda s: llm_run(TRANSLATE_PROMPT, s, max_factor=3) or s

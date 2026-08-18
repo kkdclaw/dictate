@@ -26,6 +26,20 @@ def words(s: str) -> list:
     return re.findall(r"[\w-]+", s)
 
 
+def degenerate(text: str) -> bool:
+    """Похоже на зацикливание распознавания: одно слово занимает пол-фразы.
+
+    Whisper на плохой записи выдаёт «secular secular secular…» сотнями раз.
+    Такая строка делала слово самым частым словом истории, автослой тащил его
+    в словарь, словарь уходит в initial_prompt — и Whisper, уже подсказанный,
+    выдавал его снова. Петля: галлюцинация → словарь → галлюцинация."""
+    ws = [w.lower() for w in words(text or "")]
+    if len(ws) < 8:
+        return False  # «да, да, да» — это не зацикливание
+    top = Counter(ws).most_common(1)[0][1]
+    return top >= 8 and top >= len(ws) * 0.4
+
+
 def correction_pairs(raw: str, clean: str):
     """Пары (сырое слово -> чистое слово) из пословного диффа одной записи."""
     a, b = words(raw), words(clean)
@@ -55,8 +69,9 @@ def load_terms() -> set:
 
 def suggestions(min_count: int) -> list:
     db = sqlite3.connect(os.path.join(BASE, "history.sqlite3"))
-    rows = db.execute("SELECT raw_text, text FROM transcriptions "
-                      "WHERE raw_text != text").fetchall()
+    rows = [r for r in db.execute("SELECT raw_text, text FROM transcriptions "
+                                  "WHERE raw_text != text").fetchall()
+            if not degenerate(r[0])]
     db.close()
     counts = Counter()
     for raw, clean in rows:
@@ -81,7 +96,8 @@ def build_auto_terms(llm_run=None, cap=40) -> list:
     латиница в русской речи, повторившиеся исправления LLM,
     редкие русские слова (отбирает LLM, если передан llm_run)."""
     db = sqlite3.connect(os.path.join(BASE, "history.sqlite3"))
-    raws = [r[0] for r in db.execute("SELECT raw_text FROM transcriptions")]
+    raws = [r[0] for r in db.execute("SELECT raw_text FROM transcriptions")
+            if r[0] and not degenerate(r[0])]
     db.close()
     known = load_terms()
     picked = []
@@ -90,8 +106,11 @@ def build_auto_terms(llm_run=None, cap=40) -> list:
         if w and w.lower() not in known and w.lower() not in {p.lower() for p in picked}:
             picked.append(w)
 
-    # 1) латинские слова в русской диктовке (Kubernetes, Redis...), >=2 раз
-    lat = Counter(w for t in raws for w in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", t))
+    # 1) латинские слова в русской диктовке (Kubernetes, Redis...) — считаем
+    # ОДИН раз на диктовку: слово, двадцать раз повторённое в одной фразе, это
+    # не жаргон, а сбой распознавания. Берём то, что встретилось в ≥2 диктовках
+    lat = Counter(w for t in raws
+                  for w in set(re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", t)))
     for w, n in lat.most_common():
         if n >= 2:
             add(w)
