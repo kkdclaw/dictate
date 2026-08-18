@@ -28,10 +28,12 @@ PENDING = "считаю…"
 
 _win = None
 _stack = None
-# «видно ли окно» держим обычным флагом, а не спрашиваем у NSPanel: is_visible()
-# зовут из ML-потока и из потока горячей клавиши, а AppKit не потокобезопасен
+# Открытость окна держим номером сессии, а не флагом «нарисовано»: show() уходит
+# в главный поток через callAfter, и ML-поток, спросивший сразу после вызова,
+# получал бы «окна нет» и не считал стили. Номер ставится синхронно в show().
+# Спрашивают из ML-потока и из потока горячей клавиши — AppKit тут трогать нельзя.
 _state = {"variants": [], "on_pick": None, "on_cancel": None,
-          "buttons": [], "closing": False, "visible": False}
+          "buttons": [], "closing": False, "session": 0, "open_session": None}
 
 
 class _ReviewHandler(NSObject):
@@ -53,7 +55,7 @@ class _ReviewHandler(NSObject):
 
     def windowWillClose_(self, note):
         # крестик в заголовке — тоже отказ от вставки
-        _state["visible"] = False
+        _state["open_session"] = None
         if _state["closing"]:
             return  # окно убираем мы сами, отказ уже обработан
         cb = _state["on_cancel"]
@@ -190,7 +192,9 @@ def _fit():
             NSMakeRect(old.origin.x, old.origin.y + old.size.height - h, W, h), True)
 
 
-def _show_main(variants, on_pick, on_cancel):
+def _show_main(variants, on_pick, on_cancel, session):
+    if session != _state["open_session"]:
+        return  # окно уже отменили (новая диктовка), рисовать нечего
     if _win is None:
         _build()
     _state.update(variants=list(variants), on_pick=on_pick, on_cancel=on_cancel,
@@ -203,11 +207,12 @@ def _show_main(variants, on_pick, on_cancel):
         _state["buttons"].append(b)
     _fit()
     _place()
-    _state["visible"] = True
     _win.orderFrontRegardless()  # без активации приложения: фокус остаётся в поле
 
 
-def _update_main(key, text):
+def _update_main(session, key, text):
+    if session != _state["open_session"]:
+        return  # ответ от прошлой фразы: её окно уже закрыто
     for i, v in enumerate(_state["variants"]):
         if v["key"] == key:
             v["text"] = text
@@ -218,33 +223,41 @@ def _update_main(key, text):
 
 
 def _close_main(cancelled: bool):
-    if _win is None or not _state["visible"]:
+    if _state["open_session"] is None:
         return
     cb = _state["on_cancel"] if cancelled else None
     _state["on_pick"] = _state["on_cancel"] = None
+    _state["open_session"] = None
     _state["closing"] = True  # не будить windowWillClose_ вторым отказом
     try:
-        _win.orderOut_(None)
+        if _win is not None:
+            _win.orderOut_(None)
     finally:
         _state["closing"] = False
-        _state["visible"] = False
     if cb:
         cb()
 
 
-def show(variants, on_pick, on_cancel=None):
+def show(variants, on_pick, on_cancel=None) -> int:
     """variants: [{"key", "title", "text"}]; text=None — «считаю…».
-    on_pick(key, text) и on_cancel() зовутся на главном потоке."""
-    AppHelper.callAfter(_show_main, variants, on_pick, on_cancel)
+    on_pick(key, text) и on_cancel() зовутся на главном потоке.
+    Возвращает номер сессии — с ним досчитанные стили отдаются в update()."""
+    _state["session"] += 1
+    _state["open_session"] = _state["session"]  # синхронно: см. комментарий у _state
+    AppHelper.callAfter(_show_main, variants, on_pick, on_cancel, _state["session"])
+    return _state["session"]
 
 
-def update(key: str, text: str):
-    AppHelper.callAfter(_update_main, key, text)
+def update(session: int, key: str, text: str):
+    AppHelper.callAfter(_update_main, session, key, text)
 
 
 def close():
     AppHelper.callAfter(_close_main, True)
 
 
-def is_visible() -> bool:
-    return bool(_state["visible"])
+def is_open(session: int | None = None) -> bool:
+    """Есть незакрытое окно (возможно, ещё не нарисованное) — и, если спросили
+    про конкретную сессию, именно оно."""
+    cur = _state["open_session"]
+    return cur is not None and (session is None or cur == session)

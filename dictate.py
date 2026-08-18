@@ -1338,25 +1338,26 @@ def ml_worker(ready: threading.Event):
             variants.append({"key": rec["style"],
                              "title": f"{STYLES.get(rec['style'], rec['style'])} · "
                                       f"обычный результат", "text": rec["text"]})
-        extra = [st for st in CONFIG["review_styles"]
-                 if st not in {v["key"] for v in variants}]
+        extra = [st for st in CONFIG["review_styles"]  # None = выключенная ячейка
+                 if st and st not in {v["key"] for v in variants}]
         variants += [{"key": st, "title": STYLES.get(st, st), "text": None} for st in extra]
-        reviewwindow.show(variants,
-                          on_pick=lambda key, text: _review_pick(rec, key, text),
-                          on_cancel=lambda: print("  ⇠ постобработка: ничего не вставлено",
-                                                  flush=True))
+        sid = reviewwindow.show(
+            variants, on_pick=lambda key, text: _review_pick(rec, key, text),
+            on_cancel=lambda: print("  ⇠ постобработка: ничего не вставлено", flush=True))
         print(f"  ⇢ окно постобработки: {len(variants)} варианта(ов), считаю "
               f"{', '.join(STYLES.get(st, st) for st in extra) or '—'}", flush=True)
         for st in extra:
-            if not reviewwindow.is_visible():
+            if not reviewwindow.is_open(sid):
                 print("  окно постобработки закрыли — остальные стили не считаю", flush=True)
                 break
+            t0 = time.time()
             try:
                 out = polish(st, render(st, rec["raw"], doubtful))
             except Exception as e:
                 out = rec["raw"]
                 print(f"  ✗ стиль «{st}» не посчитан ({e}) — оставил сырой", flush=True)
-            reviewwindow.update(st, out)
+            reviewwindow.update(sid, st, out)
+            print(f"  ⇢ {STYLES.get(st, st)} готов за {time.time() - t0:.1f}s", flush=True)
 
     rebuild_autodict()
 
@@ -1643,7 +1644,7 @@ def cancel_recording(reason="Esc"):
 
 def start_recording():
     global recording, press_time
-    if reviewwindow.is_visible():
+    if reviewwindow.is_open():
         # окно от прошлой фразы протухло: курсор уже в другом месте
         reviewwindow.close()
     if enroll_buf["on"]:
