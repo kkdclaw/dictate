@@ -28,3 +28,6 @@ dashboard-*.html
 
 # личные сниппеты и формулировки команд
 commands.json
+
+# macOS
+.DS_Store

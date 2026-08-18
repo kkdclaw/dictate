@@ -35,6 +35,46 @@ import hotkeywindow
 import commands
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+
+class _StampedOut:
+    """Проставляет время в начале каждой строки лога.
+
+    Без времени по dictate.log нельзя понять, когда микрофон отвалился и сколько
+    длилось ожидание, — а именно это и нужно при разборе аудио-проблем.
+    Разбиваем только по "\n": tqdm рисует прогресс через "\r", и splitlines()
+    рвал бы его на куски, вставляя метку посреди полоски загрузки."""
+
+    def __init__(self, raw):
+        self._raw = raw
+        self._bol = True  # курсор в начале строки
+
+    def write(self, s):
+        if not s:
+            return 0
+        parts, buf = s.split("\n"), []
+        for i, part in enumerate(parts):
+            if self._bol and part:
+                buf.append(time.strftime("%d.%m %H:%M:%S "))
+                self._bol = False
+            buf.append(part)
+            if i < len(parts) - 1:
+                buf.append("\n")
+                self._bol = True
+        self._raw.write("".join(buf))
+        return len(s)
+
+    def flush(self):
+        self._raw.flush()
+
+    def __getattr__(self, name):  # fileno/isatty/encoding — как у настоящего потока
+        return getattr(self._raw, name)
+
+
+sys.stdout = _StampedOut(sys.stdout)
+sys.stderr = _StampedOut(sys.stderr)
+
+
 # Семантическая версия. Держим синхронно с pyproject.toml и git-тегом vX.Y.Z:
 #   MAJOR — несовместимые изменения (формат конфига/истории, смена хоткея по умолчанию)
 #   MINOR — новые возможности
@@ -454,6 +494,7 @@ _devices_cache = {"names": [], "ts": 0.0}  # для UI: без похода в P
 
 
 def _close_stream():
+    stream_holder.pop("name", None)  # поток закрыт — «текущего входа» больше нет
     old = stream_holder.pop("stream", None)
     if old:
         try:
@@ -480,10 +521,29 @@ def _pa_recycle():
 
 
 def reopen_stream(follow_default=False):
-    """Полный перезапуск аудио: закрыть поток, перечитать устройства CoreAudio, открыть заново."""
+    """Полный перезапуск аудио: закрыть поток, перечитать устройства CoreAudio,
+    открыть заново. Возвращает False, если переоткрывать было нечего.
+
+    Вочдог и вотчер смены входа просыпаются от одного события (AirPods достали
+    из кейса) и раньше переоткрывали поток дважды подряд — в логе шли два
+    «Микрофон: AirPods Pro», а Bluetooth лишний раз щёлкал A2DP↔HFP и глотал
+    первую секунду речи. Второй переоткрыватель теперь видит живой поток на том
+    же входе и уходит ни с чем."""
     with reopen_lock:
+        if stream_alive():
+            if not follow_default:
+                return False  # поток ожил, пока ждали замок (вочдог)
+            try:
+                d = _default_input(retries=1)  # retries=1 — без _pa_recycle, поток цел
+            except Exception:
+                d = None
+            if d is not None and d["name"] == stream_holder.get("name"):
+                print(f"  вход по умолчанию прежний ({d['name']}) — переоткрывать нечего",
+                      flush=True)
+                return False
         _pa_recycle()
         open_stream(follow_default=follow_default)
+        return True
 
 
 def stream_alive() -> bool:
@@ -534,6 +594,7 @@ def open_stream(follow_default=False):
                            device=dev, callback=audio_callback)
         s.start()
         stream_holder["stream"] = s
+        stream_holder["name"] = name  # для дедупликации переоткрытий
         try:  # список входов для окна состояния — обновляем, пока PortAudio наш
             _devices_cache["names"] = [d["name"] for d in sd.query_devices()
                                        if d["max_input_channels"] > 0]
@@ -548,20 +609,30 @@ def open_stream(follow_default=False):
 mic_changed = threading.Event()
 
 
+WAIT_POLL_SEC = 15.0  # как часто перечитывать CoreAudio, пока входов нет вообще
+
+
 def stream_watchdog():
     """Мёртвый поток чинится сам, не дожидаясь событий CoreAudio или нажатия.
 
     Если входов нет вообще (Mac Studio без встроенного микрофона, AirPods
-    в кейсе) — тихо ждём появления, опрашивая раз в 3 с. Иначе — полное
-    переоткрытие с пробами устройств; интервал неудачных попыток растёт
-    до 30 с, чтобы не заливать лог."""
+    в кейсе) — ждём появления, перечитывая устройства раз в WAIT_POLL_SEC.
+    Раньше опрос шёл раз в 3 с, а каждый опрос — это полный
+    Pa_Terminate/Pa_Initialize: CoreAudio отвечал на это строками
+    «PaMacCore (AUHAL) err=-50» в логе, а пользы ноль — возврат микрофона всё
+    равно прилетает событием «сменился вход по умолчанию» почти мгновенно.
+
+    Иначе — полное переоткрытие с пробами устройств; интервал неудачных попыток
+    растёт до 30 с, а одна и та же ошибка в лог повторно не пишется."""
     fails = 0
     waiting = False
+    last_err = None
     while True:
-        time.sleep(min(30.0, 3.0 * (fails + 1)))
+        time.sleep(WAIT_POLL_SEC if waiting else min(30.0, 3.0 * (fails + 1)))
         if recording or stream_alive() or reopen_lock.busy():
             fails = 0
             waiting = False
+            last_err = None
             continue
         with reopen_lock:  # перечитка списка устройств, сериализовано
             _pa_recycle()
@@ -582,9 +653,11 @@ def stream_watchdog():
             continue
         waiting = False
         try:
-            print("  поток мёртв — вочдог переоткрывает...", flush=True)
+            if fails == 0:  # о каждой повторной попытке лог не спрашивал
+                print("  поток мёртв — вочдог переоткрывает...", flush=True)
             reopen_stream()
             fails = 0
+            last_err = None
         except NoMicrophone:
             if not waiting:
                 print("  микрофона нет — жду появления...", flush=True)
@@ -593,8 +666,10 @@ def stream_watchdog():
             fails = 0
         except Exception as e:
             fails += 1
-            print(f"  вочдог: не удалось ({e}), следующая попытка через "
-                  f"{min(30, 3 * (fails + 1))} с", flush=True)
+            if str(e) != last_err or fails % 10 == 0:
+                last_err = str(e)
+                print(f"  вочдог: не удалось ({e}) — пробую дальше, интервал "
+                      f"{min(30, 3 * (fails + 1))} с", flush=True)
 
 
 def mic_watcher():
@@ -608,6 +683,11 @@ def mic_watcher():
         try:
             print("Сменился вход по умолчанию — переключаюсь...", flush=True)
             reopen_stream(follow_default=True)
+        except NoMicrophone:
+            # не ошибка: наушники убрали в кейс, крышку закрыли. Вочдог подхватит
+            STATE["mic"] = "нет — подключи микрофон"
+            print("  входов пока нет — подключи микрофон, поток поднимется сам",
+                  flush=True)
         except Exception as e:
             print(f"  не удалось переключить микрофон: {e}", flush=True)
         # открытие потока на AirPods само переводит их A2DP→HFP, и CoreAudio
