@@ -33,6 +33,7 @@ import enrollwindow
 import hotkey
 import hotkeywindow
 import commands
+import reviewwindow
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -80,7 +81,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -129,6 +130,7 @@ STYLES = {  # ключ -> подпись в меню
     "clean": "Чистка (по умолчанию)",
     "casual": "Разговорный (без точек)",
     "formal": "Строгий (письменный)",
+    "brief": "Кратко (сжать до сути)",
     "raw": "Как сказано (без LLM)",
     "translate": "Перевод → EN",
 }
@@ -139,6 +141,8 @@ CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "restore_clipboard": True,     # после вставки вернуть в буфер то, что там лежало
           "commands": True,              # голосовые команды и сниппеты (commands.py)
           "auto_check_updates": False,   # один git ls-remote через минуту после старта; ставить — только вручную
+          "review": False,               # окно постобработки: спрашивать, какой вариант вставить
+          "review_styles": ["formal", "brief"],  # два стиля-кандидата в этом окне
           **hud.DEFAULTS}  # индикатор записи и звуки
 
 
@@ -210,6 +214,10 @@ def load_config():
                           if isinstance(a, str) and st in STYLES}
     if CONFIG.get("default_style") not in STYLES:
         CONFIG["default_style"] = "clean"
+    rs = [st for st in CONFIG.get("review_styles", []) if st in STYLES]
+    # ровно два слота: окно постобработки рисует их как «Стиль 1» и «Стиль 2»
+    CONFIG["review_styles"] = (rs + [st for st in defaults["review_styles"]
+                                     if st not in rs])[:2]
     for role, cfg_key in ROLE_CFG.items():
         if not isinstance(CONFIG.get(cfg_key), str) or "/" not in CONFIG[cfg_key]:
             CONFIG[cfg_key] = defaults[cfg_key]
@@ -1100,6 +1108,13 @@ TRANSLATE_PROMPT = (
     "Translate the dictated Russian text into natural, fluent English. "
     "Keep the meaning, tone and technical terms. Output ONLY the translation."
 )
+BRIEF_PROMPT = (
+    "Ты редактор. Сожми надиктованный текст до сути: убери повторы, воду, "
+    "вводные обороты и слова-паразиты. Все факты, числа, суммы, даты, имена, "
+    "названия и термины сохрани дословно — терять их нельзя. Ничего не "
+    "добавляй от себя, смысл и язык оригинала не меняй. "
+    "Выведи ТОЛЬКО итоговый текст."
+)
 FORMAL_PROMPT_ADDON = (
     "\nДополнительно: оформи как аккуратный письменный текст — законченные "
     "предложения, правильная пунктуация, без разговорных огрызков."
@@ -1265,10 +1280,91 @@ def ml_worker(ready: threading.Event):
             return raw
         return out
 
+    def render(style: str, raw: str, doubtful=None) -> str:
+        """Текст в заданном стиле. Одна точка входа и для обычной вставки, и для
+        вариантов окна постобработки — иначе «Строгий» в окне и «Строгий» в меню
+        со временем разъехались бы."""
+        if style == "translate":
+            return llm_run(TRANSLATE_PROMPT, raw, max_factor=3) or raw
+        if style == "formal":
+            return enhance(raw, formal=True, doubtful=doubtful)
+        if style == "brief":
+            return llm_run(BRIEF_PROMPT, raw) or raw
+        if style == "raw":
+            return raw
+        if STATE["enhance"] and (needs_enhance(raw) or doubtful):  # clean / casual
+            out = enhance(raw, doubtful=doubtful)
+            terms_lower = {t.strip().lower() for t in load_terms().split(",")}
+            guarded = guard_correction(raw, out, terms_lower)
+            if guarded != out:
+                print("  ⛔ пост-контроль откатил часть правок LLM", flush=True)
+            return guarded
+        return raw
+
+    def polish(style: str, text: str) -> str:
+        return text.rstrip(".") if style == "casual" else strip_short_period(text)
+
+    def store(rec):
+        """История + строка в лог. Общая для обычной вставки и для выбора
+        в окне постобработки: иначе половина диктовок не попадала бы в поиск."""
+        db.execute(
+            "INSERT INTO transcriptions (ts, text, raw_text, duration, app, "
+            "style, asr_ms, llm_ms, gen_tps, gen_tokens, vp_sim) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (rec["ts"], rec["text"], rec["raw"], rec["duration"], rec["app"],
+             rec["style"], rec["asr_ms"], rec["llm_ms"], rec["gen_tps"],
+             rec["gen_tokens"], rec["vp_sim"]))
+        db.commit()
+        raw, text, doubtful = rec["raw"], rec["text"], rec.get("doubtful") or []
+        mark = "" if text == strip_short_period(raw) else f"  (сырой: {raw})"
+        doubt = f"  [сомнения: {', '.join(doubtful[:5])}]" if doubtful else ""
+        speed = f" @{rec['gen_tps']:.0f}т/с" if rec["gen_tps"] else ""
+        # сходство печатаем и при успехе: иначе непонятно, есть ли запас до порога
+        vp = f" голос {rec['vp_sim']:.2f}" if rec["vp_sim"] is not None else ""
+        t_asr = rec["asr_ms"] / 1000
+        rtf = rec["duration"] / t_asr if t_asr else 0
+        pick = " ✓выбран" if rec.get("picked") else ""
+        print(f"  [{rec['duration']:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
+              f"llm {rec['llm_ms'] / 1000:.1f}s{speed}{vp} → {rec['app']}/"
+              f"{rec['style']}{pick}] {text}{mark}{doubt}", flush=True)
+
+    def offer_review(rec, doubtful):
+        """Окно с вариантами: сырой и обычный есть сразу, два стиля досчитываем,
+        пока человек читает первые два. Вставку и запись в историю делает уже
+        клик по варианту (_review_pick), поэтому задача ML-потока здесь кончается."""
+        variants = [{"key": "raw", "title": "Как сказано · сырой Whisper",
+                     "text": polish("raw", rec["raw"])}]
+        if rec["text"] != variants[0]["text"]:  # LLM ничего не поменяла — не дублируем
+            variants.append({"key": rec["style"],
+                             "title": f"{STYLES.get(rec['style'], rec['style'])} · "
+                                      f"обычный результат", "text": rec["text"]})
+        extra = [st for st in CONFIG["review_styles"]
+                 if st not in {v["key"] for v in variants}]
+        variants += [{"key": st, "title": STYLES.get(st, st), "text": None} for st in extra]
+        reviewwindow.show(variants,
+                          on_pick=lambda key, text: _review_pick(rec, key, text),
+                          on_cancel=lambda: print("  ⇠ постобработка: ничего не вставлено",
+                                                  flush=True))
+        print(f"  ⇢ окно постобработки: {len(variants)} варианта(ов), считаю "
+              f"{', '.join(STYLES.get(st, st) for st in extra) or '—'}", flush=True)
+        for st in extra:
+            if not reviewwindow.is_visible():
+                print("  окно постобработки закрыли — остальные стили не считаю", flush=True)
+                break
+            try:
+                out = polish(st, render(st, rec["raw"], doubtful))
+            except Exception as e:
+                out = rec["raw"]
+                print(f"  ✗ стиль «{st}» не посчитан ({e}) — оставил сырой", flush=True)
+            reviewwindow.update(st, out)
+
     rebuild_autodict()
 
     while True:
         kind, payload = jobs.get()
+        if kind == "logrec":  # выбрали вариант в окне постобработки
+            store(payload)
+            continue
         if kind == "autodict":
             rebuild_autodict()
             continue
@@ -1437,28 +1533,26 @@ def ml_worker(ready: threading.Event):
             last_stats.clear()  # сбрасываем перед возможным запуском LLM
             t1 = time.time()
             try:
-                if style == "translate":
-                    text = llm_run(TRANSLATE_PROMPT, raw, max_factor=3) or raw
-                elif style == "formal":
-                    text = enhance(raw, formal=True, doubtful=doubtful)
-                elif style == "raw":
-                    pass
-                elif STATE["enhance"] and (needs_enhance(raw) or doubtful):  # clean / casual
-                    text = enhance(raw, doubtful=doubtful)
-                    terms_lower = {t.strip().lower() for t in load_terms().split(",")}
-                    guarded = guard_correction(raw, text, terms_lower)
-                    if guarded != text:
-                        print(f"  ⛔ пост-контроль откатил часть правок LLM", flush=True)
-                        text = guarded
+                text = render(style, raw, doubtful)
             except Exception as e:
                 print(f"  ошибка обработки (вставляю сырой): {e}", flush=True)
+                text = raw
             t_llm = time.time() - t1
-            if style == "casual":
-                text = text.rstrip(".")
-            else:
-                text = strip_short_period(text)
+            text = polish(style, text)
             if snippet_tail:  # «пиши на, моя почта» — одной вставкой
                 text = text + ("\n" if "\n" in snippet_tail else " ") + snippet_tail
+            rec = {"ts": time.time(), "text": text, "raw": raw, "duration": duration,
+                   "app": app, "style": style, "asr_ms": round(t_asr * 1000),
+                   "llm_ms": round(t_llm * 1000), "gen_tps": last_stats.get("gen_tps"),
+                   "gen_tokens": last_stats.get("gen_tokens"), "vp_sim": vp_sim,
+                   "doubtful": list(doubtful)}
+            if CONFIG["review"] and not cmd:
+                # с голосовой командой окно не показываем: команда («отправь»,
+                # «удали») выполняется сразу после вставки, а вставка тут уезжает
+                # на неопределённое время — до клика
+                offer_review(rec, doubtful)
+                ok = True
+                continue
             paste_text(text)
             LAST_PASTE.update(text=text, raw=raw, app=app, ts=time.time())
             ok = True
@@ -1471,24 +1565,7 @@ def ml_worker(ready: threading.Event):
                     print(f"  ⚡ команда «{cmd.phrase}» → {what}", flush=True)
                 except RuntimeError as e:
                     print(f"  ⚡ команда «{cmd.phrase}» не выполнена: {e}", flush=True)
-            gen_tps = last_stats.get("gen_tps")
-            gen_tokens = last_stats.get("gen_tokens")
-            db.execute(
-                "INSERT INTO transcriptions (ts, text, raw_text, duration, app, "
-                "style, asr_ms, llm_ms, gen_tps, gen_tokens, vp_sim) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (time.time(), text, raw, duration, app, style,
-                 round(t_asr * 1000), round(t_llm * 1000), gen_tps, gen_tokens, vp_sim))
-            db.commit()
-            mark = "" if text == strip_short_period(raw) else f"  (сырой: {raw})"
-            doubt = f"  [сомнения: {', '.join(doubtful[:5])}]" if doubtful else ""
-            speed = f" @{gen_tps:.0f}т/с" if gen_tps else ""
-            # сходство печатаем и при успехе: иначе непонятно, есть ли запас до порога
-            vp = f" голос {vp_sim:.2f}" if vp_sim is not None else ""
-            rtf = duration / t_asr if t_asr else 0
-            print(f"  [{duration:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
-                  f"llm {t_llm:.1f}s{speed}{vp} → {app}/{style}] {text}{mark}{doubt}",
-                  flush=True)
+            store(rec)
         except Exception as e:
             # любое необработанное исключение раньше убивало поток навсегда:
             # иконка «готов», хоткей пишет, а текст не вставляется никогда
@@ -1508,6 +1585,26 @@ toggle_mode = False
 press_time = 0.0
 hk_down = False        # хоткей-НЕмодификатор сейчас зажат: глушим автоповтор клавиши
 hk_capture = {"on": False, "cb": None, "held_vk": None}  # захват «своего сочетания» из меню
+
+
+def _review_pick(rec, key, text):
+    """Клик по варианту в окне постобработки: вставляем и дописываем историю.
+
+    Зовётся на главном потоке из reviewwindow. Историю пишет ML-поток (соединение
+    sqlite привязано к нему), поэтому запись уходит туда задачей «logrec»."""
+    now = frontmost_app()
+    if now and now != rec["app"]:
+        print(f"  ⚠ фокус уже в «{now}», а диктовали в «{rec['app']}» — "
+              f"вставляю туда, где курсор", flush=True)
+    try:
+        paste_text(text)
+    except Exception as e:
+        print(f"  ✗ вставка не удалась: {e}", flush=True)
+        hud.play("error")
+        return
+    LAST_PASTE.update(text=text, raw=rec["raw"], app=now or rec["app"], ts=time.time())
+    jobs.put(("logrec", {**rec, "text": text, "style": key, "picked": True,
+                         "app": now or rec["app"], "ts": time.time()}))
 
 
 def stop_and_submit():
@@ -1546,6 +1643,9 @@ def cancel_recording(reason="Esc"):
 
 def start_recording():
     global recording, press_time
+    if reviewwindow.is_visible():
+        # окно от прошлой фразы протухло: курсор уже в другом месте
+        reviewwindow.close()
     if enroll_buf["on"]:
         # идёт запись отпечатка/проверки: два захвата с одного потока перепутают
         # звук между собой
@@ -1741,6 +1841,7 @@ class DictateApp(rumps.App):
             it = rumps.MenuItem(label, callback=self.set_default_style)
             it._style_key = key
             self.default_style.add(it)
+        self.review_menu = self._build_review_menu()
         self.translate_item = rumps.MenuItem("Перевод → EN (везде)", callback=self.toggle_translate)
         self.translate_item.state = int(CONFIG["translate_all"])
         self.voice_menu = self._build_voice_menu()
@@ -1762,7 +1863,8 @@ class DictateApp(rumps.App):
         self.cmd_menu.add(rumps.MenuItem("Файл команд и сниппетов…", callback=self.open_commands))
 
         self.menu = [self.status_item, self.perm_item, self.mic_item, self.recent, None,
-                     self.profile, self.default_style, self.translate_item, None,
+                     self.profile, self.default_style, self.review_menu,
+                     self.translate_item, None,
                      self.voice_menu,
                      None,
                      self.hotkey_menu,
@@ -1884,6 +1986,54 @@ class DictateApp(rumps.App):
         threading.Thread(target=probe, daemon=True).start()
 
     # --- мой голос ------------------------------------------------------------
+    def _build_review_menu(self):
+        """Окно постобработки: включение и два стиля-кандидата.
+
+        Стили лежат в слотах, а не жёстко «строгий + кратко»: под задачу нужны
+        разные пары (перевод для переписки, разговорный для чата)."""
+        m = rumps.MenuItem("Окно постобработки")
+        self.review_on = rumps.MenuItem("Спрашивать, какой вариант вставить",
+                                        callback=self.toggle_review)
+        self.review_on.state = int(CONFIG["review"])
+        m.add(self.review_on)
+        m.add(rumps.separator)
+        self.review_slots = []
+        for slot in (0, 1):
+            sm = rumps.MenuItem(f"Стиль {slot + 1}: …")
+            for key, label in STYLES.items():
+                if key == "raw":
+                    continue  # сырой вариант в окне и так всегда первой строкой
+                it = rumps.MenuItem(label, callback=self.set_review_style)
+                it._style_key, it._slot = key, slot
+                sm.add(it)
+            m.add(sm)
+            self.review_slots.append(sm)
+        self._sync_review_menu()
+        return m
+
+    def _sync_review_menu(self):
+        for slot, sm in enumerate(self.review_slots):
+            cur = CONFIG["review_styles"][slot]
+            sm.title = f"Стиль {slot + 1}: {STYLES.get(cur, cur)}"
+            for it in sm.values():
+                it.state = int(it._style_key == cur)
+
+    def toggle_review(self, sender):
+        CONFIG["review"] = not CONFIG["review"]
+        sender.state = int(CONFIG["review"])
+        if not CONFIG["review"]:
+            reviewwindow.close()
+        save_config()
+
+    def set_review_style(self, sender):
+        other = CONFIG["review_styles"][1 - sender._slot]
+        if sender._style_key == other:  # два одинаковых слота — бессмысленны
+            CONFIG["review_styles"][1 - sender._slot] = \
+                CONFIG["review_styles"][sender._slot]
+        CONFIG["review_styles"][sender._slot] = sender._style_key
+        self._sync_review_menu()
+        save_config()
+
     def _build_voice_menu(self):
         """Всё про отпечаток в одном месте: состояние, запись, проверка, строгость."""
         m = rumps.MenuItem("Мой голос")

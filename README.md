@@ -7,7 +7,8 @@ whatever app has focus; the clipboard is restored afterwards.
 Pipeline: Silero VAD → Whisper large-v3-turbo on MLX (with a user dictionary
 fed via `initial_prompt` — the main quality lever for jargon) → optional
 filler-word cleanup by a local Qwen3-4B (runs only when needed) → paste via
-synthetic ⌘V → SQLite history. Ships as a menu bar app with a launchd daemon
+synthetic ⌘V → SQLite history. An optional review window offers the raw
+transcript and two style rewrites to pick from before pasting. Ships as a menu bar app with a launchd daemon
 (auto-start, self-healing microphone selection, permission bootstrap), a
 caret-anchored recording capsule with level meter, sound cues, a status window
 (service / TCC permissions / microphone / models / hotkey), and a model manager
@@ -136,8 +137,22 @@ HuggingFace (предложит дефолтные: Whisper large-v3-turbo + Qwe
 - **Микрофон: …** — с какого устройства сейчас пишем (обновляется живьём);
 - **Профиль «<приложение>»** — стиль вставки для приложения, в котором сейчас
   курсор: Чистка / Разговорный (без точек) / Строгий (письменный) /
-  Как сказано (без LLM) / Перевод → EN. Выбор запоминается в `config.json`;
+  Кратко (сжать до сути) / Как сказано (без LLM) / Перевод → EN. Выбор
+  запоминается в `config.json`;
 - **Стиль по умолчанию** — то же для всех приложений без своего профиля;
+- **Окно постобработки** — выключено по умолчанию. Когда включено, фраза не
+  вставляется сразу: у курсора всплывает окно с вариантами — «Как сказано»
+  (сырой Whisper, без LLM), обычный результат и два стиля на выбор (по
+  умолчанию «Строгий» и «Кратко»; слоты меняются тут же в подменю). Клик по
+  варианту вставляет его в то же поле. Зачем: LLM-чистка иногда меняет смысл —
+  ослышка распознавателя плюс «исправление» модели, — и окно даёт откатиться на
+  сырой текст или взять другую формулировку, не передиктовывая. Сырой и обычный
+  варианты готовы сразу, стили дописываются на ходу («считаю…»), выбирать можно
+  не дожидаясь. Окно **не забирает фокус** (нативная неактивирующая панель) —
+  поэтому ⌘V попадает ровно туда, куда попал бы и без окна, но и выбор только
+  мышью: клавиши ушли бы в чужое поле ввода. «Не вставлять» или крестик —
+  отказ; новая диктовка закрывает протухшее окно сама. С голосовой командой
+  («…отправь») окно не показывается: команда выполняется сразу за вставкой;
 - **Перевод → EN (везде)** — глобальный тумблер: диктуешь по-русски,
   вставляется английский перевод (локальный Qwen, ~+1.5 с);
 - **Мой голос** — подменю голосового отпечатка (ECAPA-эмбеддинги): речь, не
