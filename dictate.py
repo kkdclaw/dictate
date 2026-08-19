@@ -2175,33 +2175,53 @@ class DictateApp(rumps.App):
 
     # --- о программе и обновления ---------------------------------------------
     def _build_about_menu(self):
+        """Обновления: одна строка — состояние, следующая — действие.
+
+        Раньше строка «Обновления» была и тем и другим сразу: первый клик
+        спрашивал GitHub, второй ставил, а между ними всплывало окно «нажми эту
+        строку ещё раз». Теперь на кнопке всегда написано, что произойдёт по
+        клику, а состояние живёт отдельной некликабельной строкой."""
         m = rumps.MenuItem(f"О программе · {VERSION}")
         self.ver_item = rumps.MenuItem(f"Версия {app_version()}",
                                        callback=self.copy_version)
-        self.upd_item = rumps.MenuItem("Обновления: …", callback=self.update_clicked)
+        self.upd_status = rumps.MenuItem("Обновления: …")  # без callback — просто строка
+        self.upd_item = rumps.MenuItem(update_action_label(), callback=self.update_clicked)
         self.restart_item = rumps.MenuItem("Перезапустить службу", callback=self.restart_clicked)
         self.autoupd_item = rumps.MenuItem("Проверять обновления при запуске",
                                            callback=self.toggle_auto_check)
         self.autoupd_item.state = int(bool(CONFIG.get("auto_check_updates")))
         m.add(self.ver_item)
+        m.add(self.upd_status)
         m.add(self.upd_item)
         m.add(self.autoupd_item)
         m.add(None)
         m.add(self.restart_item)
+        m.add(rumps.MenuItem("Как это работает…", callback=self.update_help))
         return m
 
     def refresh_about(self, _=None):
-        upd = f"Обновления: {update_summary()}"
-        if upd != self.upd_item.title:
-            self.upd_item.title = upd
         # сама версия неизменна, но пометка «на диске новее» появляется после pull
         stale = code_updated_on_disk()
-        title = f"Версия {app_version()}" + (" · ⬆️ на диске новее, нужен перезапуск" if stale else "")
-        if title != self.ver_item.title:
-            self.ver_item.title = title
-        rs = "⬆️ Перезапустить службу — на диске новее" if stale else "Перезапустить службу"
-        if rs != self.restart_item.title:
-            self.restart_item.title = rs
+        # одна и та же стрелка на всём пути: ⬆️ в меню-баре → ⬆️ у «О программе»
+        # → ⬆️ на кнопке. Раньше метки в разных местах жили сами по себе, и было
+        # непонятно, куда эта стрелка ведёт
+        mark = " ⬆️" if (update_available() or stale) else ""
+        for item, title in (
+                (self.about_item, f"О программе · {VERSION}{mark}"),
+                (self.upd_status, f"Обновления: {update_summary()}"),
+                (self.upd_item, update_action_label()),
+                (self.ver_item, f"Версия {app_version()}"
+                 + (" · ⬆️ на диске новее, нужен перезапуск" if stale else "")),
+                (self.restart_item, "⬆️ Перезапустить службу — на диске новее"
+                 if stale else "Перезапустить службу")):
+            if item.title != title:
+                item.title = title
+        # пока запрос в полёте — кнопка не принимает клики (серая), а не молча
+        # игнорирует их
+        want = None if (STATE.get("update") or {}).get("busy") else self.update_clicked
+        if getattr(self, "_upd_cb", "нет") is not want:
+            self._upd_cb = want
+            self.upd_item.set_callback(want)
 
     def restart_clicked(self, _):
         if rumps.alert("Перезапуск Dictate",
@@ -2216,48 +2236,75 @@ class DictateApp(rumps.App):
         self.autoupd_item.state = int(CONFIG["auto_check_updates"])
 
     def update_clicked(self, _):
-        """Клик по строке обновлений: первый раз — спрашиваем GitHub, и если
-        нашлось новое, следующий клик показывает список изменений и предлагает
-        поставить. Сама программа в сеть не ходит — только по этой кнопке
-        (и, если включено, один раз при запуске)."""
+        """Кнопка делает ровно то, что на ней написано.
+
+        Нечего ставить — спрашиваем GitHub, и если что-то нашлось, СРАЗУ
+        показываем список изменений и предлагаем поставить: второй клик по той
+        же строке больше не нужен, а с ним ушло и окно «нажми ещё раз».
+        В сеть ходим только отсюда (и, если включена галка, один раз при
+        запуске) — программа слушает клавиатуру и микрофон, тихо подменять её
+        код нельзя."""
         u = STATE.get("update") or {}
         if u.get("busy"):
             return  # запрос уже в полёте
         if update_available(u):
-            what = (f"версии {u['tag']}" if u.get("tag") else "свежих правок с main")
-            log = u.get("log") or []
-            shown = log[:12]
-            changes = ("\n".join(f"• {l}" for l in shown)
-                       + (f"\n… и ещё {len(log) - len(shown)}" if len(log) > len(shown) else "")
-                       ) if log else "(список изменений получить не удалось)"
-            if rumps.alert("Обновление Dictate",
-                           f"Сейчас: {app_version()}.\nДоступно обновление до {what}.\n\n"
-                           f"Что изменилось:\n{changes}\n\n"
-                           "Будет выполнено: git pull (только перемотка), проверка "
-                           "компиляции, при смене зависимостей — uv sync, затем перезапуск "
-                           "службы. Если новая версия не соберётся — откат на текущую.\n"
-                           "Незакоммиченные правки не тронем — при их наличии откажусь.",
-                           ok="Обновить", cancel="Позже") != 1:
-                return
-            threading.Thread(target=lambda: notify_ui("Обновление Dictate", apply_update()),
-                             daemon=True).start()
+            self._offer_install(u)
             return
 
         def probe():
-            STATE["update"] = {"busy": True}  # в меню видно, что запрос пошёл
+            STATE["update"] = {"busy": True}  # кнопка на это время гаснет
             res = check_update()
             STATE["update"] = res
             if res.get("error"):
-                notify_ui("Обновление Dictate", f"Не смог спросить GitHub: {res['error']}")
+                notify_ui("Обновления",
+                          f"Не смог спросить GitHub: {res['error']}\n\n"
+                          "Проверь сеть и нажми «Проверить обновления» ещё раз. "
+                          "Установленная версия при этом работает как работала.")
             elif update_available(res):
-                notify_ui("Обновление Dictate",
-                          f"Установлено: {app_version()}\nЕсть новое: {update_summary()}\n\n"
-                          "Нажми строку «Обновления» ещё раз — покажу список изменений "
-                          "и предложу поставить.")
+                from PyObjCTools import AppHelper
+                AppHelper.callAfter(self._offer_install, res)  # окна — с главного потока
             else:
-                notify_ui("Обновление Dictate",
-                          f"Установлено: {app_version()}\nЭто последняя версия.")
+                notify_ui("Обновления", f"Установлено: {app_version()}\n"
+                          "Это последняя версия — ставить нечего.")
         threading.Thread(target=probe, daemon=True).start()
+
+    def _offer_install(self, u: dict):
+        """Что приедет, что при этом произойдёт, и одна кнопка установки."""
+        what = f"версии {u['tag']}" if u.get("tag") else "свежих правок с main"
+        log = u.get("log") or []
+        shown = log[:12]
+        changes = ("\n".join(f"• {l}" for l in shown)
+                   + (f"\n… и ещё {len(log) - len(shown)}" if len(log) > len(shown) else "")
+                   ) if log else "(список изменений получить не удалось)"
+        if rumps.alert("Обновление Dictate",
+                       f"Сейчас: {app_version()}.\nДоступно обновление до {what}.\n\n"
+                       f"Что изменилось:\n{changes}\n\n"
+                       "По кнопке: git pull (только перемотка), проверка компиляции, "
+                       "при смене зависимостей — uv sync, затем перезапуск службы. "
+                       "Если новая версия не соберётся — откат на текущую.\n"
+                       "Незакоммиченные правки не тронем — при их наличии откажусь.",
+                       ok="Установить и перезапустить", cancel="Позже") != 1:
+            return
+        threading.Thread(target=lambda: notify_ui("Обновление Dictate", apply_update()),
+                         daemon=True).start()
+
+    def update_help(self, _):
+        rumps.alert("Как обновляется Dictate",
+                    "1. «Проверить обновления» — один запрос к GitHub. Сам в сеть я не "
+                    "хожу: только по этой кнопке и, если стоит галка, один раз через "
+                    "минуту после запуска.\n\n"
+                    "2. Если новое нашлось — строка «Обновления» скажет что именно, а "
+                    "кнопка станет «Установить …». Клик по ней покажет список изменений "
+                    "и спросит подтверждение; ничего не ставится молча.\n\n"
+                    "3. После установки служба перезапускается сама: несколько секунд без "
+                    "диктовки, модели греются заново. Не собралось — откат на текущую "
+                    "версию.\n\n"
+                    "⬆️ означает одно: есть что поставить или перезапустить. Она "
+                    "появляется на всём пути — в меню-баре, у «О программе» и на самой "
+                    "кнопке.\n\n"
+                    "«Перезапустить службу» нужен отдельно, когда код на диске новее "
+                    "работающего — например, после git pull руками. Тогда рядом с "
+                    "версией появится пометка «на диске новее».")
 
     # --- мой голос ------------------------------------------------------------
     def _build_review_menu(self):
@@ -2597,12 +2644,13 @@ class DictateApp(rumps.App):
         how = "демон launchd (com.kkd.dictate, автозапуск при входе)" if os.path.exists(plist) \
             else "вручную (без демона — после выхода не поднимется сам)"
         stale = " · ⬆️ на диске новее — перезапусти" if code_updated_on_disk() else ""
-        has_upd = update_available()
+        # кнопка панели и пункт меню называются одинаково — это одно действие
+        busy = (STATE.get("update") or {}).get("busy")
         service = [
             ("Состояние", svc, "Перезапустить", "restart"),
             ("Версия", f"{self._version}{stale}", "Скопировать", "copy_version"),
             ("Обновления", update_summary(),
-             "Обновить и перезапустить" if has_upd else "Проверить сейчас", "update"),
+             None if busy else update_action_label(short=True), None if busy else "update"),
             ("Процесс", f"PID {os.getpid()} · работает {upt} · {how}", "Лог…", "log"),
             ("Горячая клавиша", f"{HK.label} · тап — запись до второго тапа, Esc — отмена"
              + (" · буфер обмена возвращается после вставки"
@@ -3586,20 +3634,37 @@ def app_version_of(sha: str) -> str:
 
 
 def update_summary() -> str:
-    """Строка о состоянии обновлений для меню и панели."""
+    """Строка СОСТОЯНИЯ: что мы знаем про обновления. Без «нажми» — что делает
+    клик, написано на самой кнопке (update_action_label)."""
     u = STATE.get("update")
     if not u:
-        return "нажми, чтобы проверить"
+        return "с запуска не проверялись"
     if u.get("busy"):
         return "спрашиваю GitHub…"
     when = time.strftime("%H:%M", time.localtime(u.get("checked", 0)))
     if u.get("error"):
-        return f"не проверилось ({u['error']})"
+        return f"не проверилось: {u['error']}"
     if u.get("tag"):
-        return f"⬆️ доступна {u['tag']} — нажми, чтобы обновить"
+        return f"⬆️ доступна {u['tag']}, установлена {VERSION} (проверено в {when})"
     if u.get("commits"):
-        return "⬆️ есть свежие правки на main — нажми, чтобы обновить"
-    return f"актуальная (проверено в {when})"
+        return f"⬆️ на main есть правки новее нашей копии (проверено в {when})"
+    return f"актуальная версия (проверено в {when})"
+
+
+def update_action_label(short: bool = False) -> str:
+    """Что произойдёт по клику — ровно это и написано на кнопке.
+
+    short — для окна состояния: колонка кнопок там 190 px, длинная подпись
+    обрезается многоточием («Установить 0.14.0 и переза…»), а обрезанная кнопка
+    как раз и есть та самая непонятность «куда я жму»."""
+    u = STATE.get("update") or {}
+    if u.get("busy"):
+        return "Спрашиваю GitHub…"
+    if u.get("tag"):
+        return f"⬆️ Установить {u['tag']}" + ("" if short else " и перезапустить…")
+    if u.get("commits"):
+        return "⬆️ Установить правки" + ("" if short else " с main…")
+    return "Проверить обновления"
 
 
 def auto_check_updates_later(delay: float = 60.0):
