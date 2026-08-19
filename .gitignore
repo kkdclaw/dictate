@@ -32,3 +32,6 @@ commands.json
 
 # macOS
 .DS_Store
+
+# слои словаря — приватные, канонические копии в ~/kb/data/dictate/terms.d/
+terms.d/

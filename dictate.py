@@ -169,6 +169,8 @@ CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "restore_clipboard": True,     # после вставки вернуть в буфер то, что там лежало
           "commands": True,              # голосовые команды и сниппеты (commands.py)
           "auto_check_updates": False,   # один git ls-remote через минуту после старта; ставить — только вручную
+          "default_terms": "",           # слой словаря по умолчанию ("" — только общий terms.txt)
+          "terms_profiles": {},          # приложение -> слой словаря (как profiles для стилей)
           "unload_llm": False,           # выгружать модель чистки из памяти, пока она не нужна
           "llm_idle_min": 10,            # столько минут без чистки — и выгружаем
           "review": False,               # окно постобработки: спрашивать, какой вариант вставить
@@ -245,6 +247,14 @@ def load_config():
                           if isinstance(a, str) and st in STYLES}
     if CONFIG.get("default_style") not in STYLES:
         CONFIG["default_style"] = "clean"
+    # слои словаря: имя слоя — просто строка, существование файла проверяем при
+    # обращении (файл могли удалить, а конфиг остался — тогда тихо берём общий)
+    if not isinstance(CONFIG.get("terms_profiles"), dict):
+        CONFIG["terms_profiles"] = {}
+    CONFIG["terms_profiles"] = {a: l for a, l in CONFIG["terms_profiles"].items()
+                                if isinstance(a, str) and isinstance(l, str)}
+    if not isinstance(CONFIG.get("default_terms"), str):
+        CONFIG["default_terms"] = ""
     # ровно REVIEW_SLOTS ячеек. Мусор и дубли превращаем в выключенную ячейку,
     # а не в «какой-нибудь стиль»: пусть окно будет короче, чем со случайной строкой
     slots = CONFIG.get("review_styles")
@@ -750,6 +760,26 @@ def mic_watcher():
 
 
 HINT_TOKENS = 210  # потолок initial_prompt — 224 токена; хвост asr_hint и зазор
+TERMS_DIR = os.path.join(BASE, "terms.d")  # слои словаря: terms.d/<слой>.txt
+
+
+def terms_layers() -> list[str]:
+    """Имена слоёв словаря — по файлам terms.d/*.txt."""
+    try:
+        return sorted(f[:-4] for f in os.listdir(TERMS_DIR)
+                      if f.endswith(".txt") and not f.startswith("."))
+    except OSError:
+        return []
+
+
+def terms_layer_for(app: str) -> str:
+    """Слой для приложения: своя настройка, иначе слой по умолчанию.
+
+    Устроено как стили: `terms_profiles` — то же, что `profiles`, а
+    `default_terms` — то же, что `default_style`. Слоя нет на диске (файл
+    удалили, конфиг остался) — молча работаем на общем словаре."""
+    layer = CONFIG["terms_profiles"].get(app, CONFIG["default_terms"]) or ""
+    return layer if layer in terms_layers() else ""
 _whisper_tok = {}
 
 
@@ -765,23 +795,31 @@ def tok_len(text: str) -> int:
         return max(1, len(text) // 3)  # грубо, если токенизатор недоступен
 
 
-def load_terms() -> str:
-    """Ручное ядро + автослой из истории, обрезанные по ТОКЕНАМ.
+def load_terms(layer: str = "") -> str:
+    """Слой + ручное ядро + автослой из истории, обрезанные по ТОКЕНАМ.
 
     Раньше резалось по словам (60 штук), а у initial_prompt Whisper потолок в
     224 ТОКЕНА, и одно русское слово — это 3–5 токенов: словарь из 58 слов
     давал 227 токенов. Лишнее Whisper отрезает С НАЧАЛА, то есть выбрасывал
-    ровно ручные термины, которые важнее автослоя."""
-    words, seen = [], set()
-    for fname in ("terms.txt", "auto_terms.txt"):
+    ровно ручные термины, которые важнее автослоя.
+
+    Порядок = приоритет: слой приложения, потом общий словарь, потом автослой.
+    Бюджет один на всех, поэтому включённый слой вытесняет хвост общего — так и
+    задумано: в терминале не нужны Guesta и Tokeet, а в переписке — launchd."""
+    paths, seen = [], set()
+    if layer:
+        paths.append(os.path.join(TERMS_DIR, f"{layer}.txt"))
+    paths += [os.path.join(BASE, "terms.txt"), os.path.join(BASE, "auto_terms.txt")]
+    words = []
+    for path in paths:
         try:
-            with open(os.path.join(BASE, fname)) as f:
+            with open(path) as f:
                 for line in f:
                     w = line.strip()
                     if w and not w.startswith("#") and w.lower() not in seen:
                         words.append(w)
                         seen.add(w.lower())
-        except FileNotFoundError:
+        except OSError:
             pass
     out, total = [], 0
     for w in words:
@@ -794,23 +832,23 @@ def load_terms() -> str:
 
 
 
-def asr_hint() -> str:
+def asr_hint(app: str = "") -> str:
     """Словарь в initial_prompt: Whisper подхватывает термины при распознавании.
 
     Служебных слов («Словарь:», «Глаголы:») в подсказке быть не должно — на
     тихих записях Whisper выдаёт их эхом и они протекают в готовый текст."""
-    terms = load_terms()
+    terms = load_terms(terms_layer_for(app))
     return f"{terms}, задеплоить." if terms else ""
 
 
-def system_prompt() -> str:
+def system_prompt(app: str = "") -> str:
     return (
         "Ты корректор надиктованного текста. Правила:\n"
         "1. Убери слова-паразиты (эээ, ну, короче, эм) и оговорки. Значимые слова "
         "(нужно, надо, давай, проверь) паразитами НЕ являются — сохраняй их.\n"
         "2. Исправляй ТОЛЬКО искажённые распознаванием слова. Грамматику, падежи, "
         "наклонение, порядок слов и смысл НЕ меняй. Ничего не добавляй и не пересказывай.\n"
-        f"3. Термины пользователя (только контекст): {load_terms()}. НИКОГДА не "
+        f"3. Термины пользователя (только контекст): {load_terms(terms_layer_for(app))}. НИКОГДА не "
         "заменяй обычное слово термином из списка и один термин другим — исправляй "
         "словом из списка только явную ослышку, созвучную ему почти целиком.\n"
         "4. Слитные глаголы, разбитые на части, склей: «За деплой сервис» → «Задеплой сервис».\n"
@@ -1493,8 +1531,8 @@ def ml_worker(ready: threading.Event):
                                   gen_tokens=resp.generation_tokens)
             return "".join(parts).strip()
 
-    def enhance(raw: str, formal: bool = False, doubtful=None) -> str:
-        system = system_prompt() + (FORMAL_PROMPT_ADDON if formal else "")
+    def enhance(raw: str, formal: bool = False, doubtful=None, app: str = "") -> str:
+        system = system_prompt(app) + (FORMAL_PROMPT_ADDON if formal else "")
         if doubtful:
             system += ("\nДополнительно: распознаватель не уверен в словах: "
                        + ", ".join(f"«{w}»" for w in doubtful[:8])
@@ -1508,14 +1546,14 @@ def ml_worker(ready: threading.Event):
             return raw
         return out
 
-    def render(style: str, raw: str, doubtful=None) -> str:
+    def render(style: str, raw: str, doubtful=None, app: str = "") -> str:
         """Текст в заданном стиле. Одна точка входа и для обычной вставки, и для
         вариантов окна постобработки — иначе «Строгий» в окне и «Строгий» в меню
         со временем разъехались бы."""
         if style == "translate":
             return llm_run(TRANSLATE_PROMPT, raw, max_factor=3) or raw
         if style == "formal":
-            return enhance(raw, formal=True, doubtful=doubtful)
+            return enhance(raw, formal=True, doubtful=doubtful, app=app)
         if style == "informal":
             return restyle(INFORMAL_TASK, raw, "informal", 1.4)
         if style == "brief":
@@ -1523,8 +1561,8 @@ def ml_worker(ready: threading.Event):
         if style == "raw":
             return raw
         if STATE["enhance"] and (needs_enhance(raw) or doubtful):  # clean / casual
-            out = enhance(raw, doubtful=doubtful)
-            terms_lower = {t.strip().lower() for t in load_terms().split(",")}
+            out = enhance(raw, doubtful=doubtful, app=app)
+            terms_lower = {t.strip().lower() for t in load_terms(terms_layer_for(app)).split(",")}
             guarded = guard_correction(raw, out, terms_lower)
             if guarded != out:
                 print("  ⛔ пост-контроль откатил часть правок LLM", flush=True)
@@ -1578,8 +1616,9 @@ def ml_worker(ready: threading.Event):
         t_asr = rec["asr_ms"] / 1000
         rtf = rec["duration"] / t_asr if t_asr else 0
         pick = " ✓выбран" if rec.get("picked") else ""
+        lay = f" словарь:{rec['layer']}" if rec.get("layer") else ""
         print(f"  [{rec['duration']:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
-              f"llm {rec['llm_ms'] / 1000:.1f}s{speed}{vp} → {rec['app']}/"
+              f"llm {rec['llm_ms'] / 1000:.1f}s{speed}{vp}{lay} → {rec['app']}/"
               f"{rec['style']}{pick}] {text}{mark}{doubt}", flush=True)
 
     def offer_review(rec, doubtful):
@@ -1606,7 +1645,7 @@ def ml_worker(ready: threading.Event):
                 break
             t0 = time.time()
             try:
-                out = polish(st, render(st, rec["raw"], doubtful))
+                out = polish(st, render(st, rec["raw"], doubtful, app=rec.get("app", "")))
             except Exception as e:
                 out = rec["raw"]
                 print(f"  ✗ стиль «{st}» не посчитан ({e}) — оставил сырой", flush=True)
@@ -1733,11 +1772,15 @@ def ml_worker(ready: threading.Event):
                           f"{CONFIG['vp_threshold']}) — не вставляю.{near}", flush=True)
                     hud.play("error")
                     continue
+            # приложение выясняем ДО распознавания: от него зависит слой словаря,
+            # а словарь уходит в initial_prompt. Раньше оно определялось после
+            app = rec_app or frontmost_app()
+            layer = terms_layer_for(app)
             t0 = time.time()
             try:
                 result = mlx_whisper.transcribe(
                     audio, path_or_hf_repo=ASR_MODEL, language=LANGUAGE,
-                    initial_prompt=asr_hint() or None, word_timestamps=True)
+                    initial_prompt=asr_hint(app) or None, word_timestamps=True)
                 raw = result["text"].strip()
             except Exception as e:
                 print(f"  ошибка распознавания: {e}", flush=True)
@@ -1759,7 +1802,7 @@ def ml_worker(ready: threading.Event):
                 continue
             # тихое аудио + initial_prompt => Whisper галлюцинирует куски словаря
             raw_words = re.findall(r"\w+", raw.lower())
-            hint_words = set(re.findall(r"\w+", asr_hint().lower()))
+            hint_words = set(re.findall(r"\w+", asr_hint(app).lower()))
             # эхо словаря — это перечисление НЕСКОЛЬКИХ терминов подряд на тихой
             # записи; одиночный термин («задеплой», «ZeroTier») — нормальная
             # диктовка, её раньше молча съедали
@@ -1777,7 +1820,6 @@ def ml_worker(ready: threading.Event):
                     print(f"  ✗ распознавание зациклилось на «{top}» ({cnt} раз из "
                           f"{len(raw_words)}) — не вставляю", flush=True)
                     continue
-            app = rec_app or frontmost_app()
             style = style_for(app)
             translate = lambda s: llm_run(TRANSLATE_PROMPT, s, max_factor=3) or s
             cmd = commands.match(raw) if CONFIG["commands"] else None
@@ -1802,7 +1844,7 @@ def ml_worker(ready: threading.Event):
             last_stats.clear()  # сбрасываем перед возможным запуском LLM
             t1 = time.time()
             try:
-                text = render(style, raw, doubtful)
+                text = render(style, raw, doubtful, app=app)
             except Exception as e:
                 print(f"  ошибка обработки (вставляю сырой): {e}", flush=True)
                 text = raw
@@ -1811,7 +1853,7 @@ def ml_worker(ready: threading.Event):
             if snippet_tail:  # «пиши на, моя почта» — одной вставкой
                 text = text + ("\n" if "\n" in snippet_tail else " ") + snippet_tail
             rec = {"ts": time.time(), "text": text, "raw": raw, "duration": duration,
-                   "app": app, "style": style, "asr_ms": round(t_asr * 1000),
+                   "app": app, "style": style, "layer": layer, "asr_ms": round(t_asr * 1000),
                    "llm_ms": round(t_llm * 1000), "gen_tps": last_stats.get("gen_tps"),
                    "gen_tokens": last_stats.get("gen_tokens"), "vp_sim": vp_sim,
                    "doubtful": list(doubtful)}
@@ -2119,6 +2161,7 @@ class DictateApp(rumps.App):
         self.translate_item.state = int(CONFIG["translate_all"])
         self.voice_menu = self._build_voice_menu()
 
+        self.terms_menu = self._build_terms_menu()
         self.models_menu = rumps.MenuItem("Модели")
         self.about_item = self._build_about_menu()
         self.status_item = rumps.MenuItem("Состояние и разрешения…", callback=self.open_status)
@@ -2149,8 +2192,7 @@ class DictateApp(rumps.App):
                      self.models_menu,
                      rumps.MenuItem("Статистика…", callback=self.open_stats),
                      rumps.MenuItem("Поиск истории…", callback=self.open_search),
-                     rumps.MenuItem("Словарь терминов…", callback=self.open_terms),
-                     rumps.MenuItem("Обновить автословарь из истории", callback=self.suggest),
+                     self.terms_menu,
                      rumps.MenuItem("Лог…", callback=self.open_log), None,
                      self.about_item]
         rumps.Timer(self.refresh_title, 0.3).start()
@@ -2160,6 +2202,8 @@ class DictateApp(rumps.App):
         rumps.Timer(self.refresh_status, 1.0).start()
         self.refresh_voice_menu()
         rumps.Timer(self.refresh_voice_menu, 3.0).start()
+        self.refresh_terms_menu()
+        rumps.Timer(self.refresh_terms_menu, 3.0).start()
         self.refresh_about()
         rumps.Timer(self.refresh_about, 5.0).start()
         self._version = app_version()
@@ -2172,6 +2216,85 @@ class DictateApp(rumps.App):
     def _boot_show_status(self, _):
         self._boot.stop()
         self.open_status(None, activate=False)  # при логине фокус не отбираем
+
+    # --- словарь и его слои ---------------------------------------------------
+    def _build_terms_menu(self):
+        """Слои словаря устроены как стили: есть слой по умолчанию и переопределение
+        на приложение. Смысл — бюджет: в подсказку Whisper влезает 210 токенов, и
+        один общий словарь на все случаи занимает его целиком (см. terms.d/README)."""
+        m = rumps.MenuItem("Словарь терминов")
+        self.terms_app_menu = rumps.MenuItem("Слой для приложения")
+        self.terms_def_menu = rumps.MenuItem("Слой по умолчанию")
+        m.add(self.terms_app_menu)
+        m.add(self.terms_def_menu)
+        m.add(None)
+        m.add(rumps.MenuItem("Открыть общий словарь…", callback=self.open_terms))
+        self.terms_layer_item = rumps.MenuItem("Открыть слой…", callback=self.open_layer)
+        m.add(self.terms_layer_item)
+        m.add(rumps.MenuItem("Папка слоёв…", callback=self.open_terms_dir))
+        m.add(None)
+        m.add(rumps.MenuItem("Обновить автословарь из истории", callback=self.suggest))
+        return m
+
+    def refresh_terms_menu(self, _=None):
+        """Пересобираем, только когда что-то изменилось: список слоёв читается с
+        диска, а меню перестраивать на каждом тике незачем."""
+        app, layers = STATE["app"], terms_layers()
+        sig = repr((app, layers, CONFIG["default_terms"],
+                    CONFIG["terms_profiles"].get(app)))
+        if sig == getattr(self, "_terms_sig", None):
+            return
+        self._terms_sig = sig
+        cur = terms_layer_for(app)
+        self.terms_menu.title = "Словарь терминов: " + (f"слой «{cur}»" if cur else "общий")
+        self.terms_app_menu.title = (f"Слой для «{app}»" if app else "Слой для приложения")
+        own = CONFIG["terms_profiles"].get(app)
+        rows = [(None, "Как по умолчанию"), ("", "— только общий —")] + [(l, l) for l in layers]
+        if self.terms_app_menu._menu is not None:  # NSMenu появляется после первого add
+            self.terms_app_menu.clear()
+        for key, label in rows:
+            it = rumps.MenuItem(label, callback=self.set_app_layer if app else None)
+            it._layer = key
+            it.state = int(own == key if key is not None else own is None)
+            self.terms_app_menu.add(it)
+        if self.terms_def_menu._menu is not None:
+            self.terms_def_menu.clear()
+        for key, label in [("", "— только общий —")] + [(l, l) for l in layers]:
+            it = rumps.MenuItem(label, callback=self.set_default_layer)
+            it._layer = key
+            it.state = int(CONFIG["default_terms"] == key)
+            self.terms_def_menu.add(it)
+        self.terms_layer_item.title = (f"Открыть слой «{cur}»…" if cur
+                                       else "Слой не выбран — открывать нечего")
+        self.terms_layer_item.set_callback(self.open_layer if cur else None)
+
+    def set_app_layer(self, sender):
+        app = STATE["app"]
+        if not app:
+            return
+        if sender._layer is None:
+            CONFIG["terms_profiles"].pop(app, None)
+        else:
+            CONFIG["terms_profiles"][app] = sender._layer
+        save_config()
+        self._terms_sig = None
+        print(f"Словарь для «{app}»: "
+              + (f"слой «{terms_layer_for(app)}»" if terms_layer_for(app) else "общий"),
+              flush=True)
+
+    def set_default_layer(self, sender):
+        CONFIG["default_terms"] = sender._layer
+        save_config()
+        self._terms_sig = None
+
+    def open_layer(self, _):
+        cur = terms_layer_for(STATE["app"])
+        if cur:
+            subprocess.run(["open", "-t", os.path.join(TERMS_DIR, f"{cur}.txt")])
+
+    def open_terms_dir(self, _):
+        os.makedirs(TERMS_DIR, exist_ok=True)  # чтобы папка открылась даже до первого слоя
+        subprocess.run(["open", TERMS_DIR])
 
     # --- о программе и обновления ---------------------------------------------
     def _build_about_menu(self):
@@ -2576,6 +2699,7 @@ class DictateApp(rumps.App):
             "dir:asr": lambda: subprocess.run(["open", _repo_dir(CONFIG["asr_model"])]),
             "dir:llm": lambda: subprocess.run(["open", _repo_dir(CONFIG["llm_model"])]),
             "hud_test": lambda: hud.preview(2.5),
+            "terms": lambda: self.open_terms(None),
             "wizard": lambda: self.open_perm_wizard(None),
         })
 
@@ -2713,6 +2837,13 @@ class DictateApp(rumps.App):
                         else " · держим постоянно (галка «Выгружать модель чистки "
                              "в простое» выключена)")
             mrows.append((title, f"{repo.split('/')[-1]}\n{txt}", btn, act))
+        layer = terms_layer_for(STATE["app"])
+        hint = load_terms(layer)
+        mrows.append(("Словарь",
+                      (f"слой «{layer}» + общий" if layer else "общий (слой не выбран)")
+                      + f" · в подсказку ушло {len(hint.split(', '))} терминов, "
+                      + f"{tok_len(hint)} из {HINT_TOKENS} токенов\n"
+                      + f"первые: {hint[:90]}…", "Открыть…", "terms"))
         ec = _repo_status("speechbrain/spkrec-ecapa-voxceleb", 90)
         ec_txt = ("● " + _fmt_mb(ec["mb"]) if ec["state"] == "done"
                   else "⏳ скачивается" if ec["state"] == "loading" else "○ не скачан (~90 МБ)")
