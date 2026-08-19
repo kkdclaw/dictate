@@ -20,6 +20,7 @@ terms.txt
 
 # личный конфиг и биометрия
 config.json
+voiceprint.npz
 voiceprint.npy
 models/
 auto_terms.txt
