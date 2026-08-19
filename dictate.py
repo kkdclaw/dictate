@@ -81,7 +81,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.12.1"
+VERSION = "0.13.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -90,7 +90,32 @@ SAMPLE_RATE = 16000
 MIN_DURATION = 0.4  # сек; короче — случайное нажатие, игнорируем
 
 STATE = {"loading": True, "mic": "…", "enhance": True, "app": "", "error": "",
-         "perms": {}, "last_hotkey": 0.0, "started": time.time(), "perms_ts": 0.0}
+         "perms": {}, "last_hotkey": 0.0, "started": time.time(), "perms_ts": 0.0,
+         "stage": None, "stage_ts": 0.0}
+
+# Этапы прогрева. Нужны не для красоты: раньше между «Прогреваю модели» и
+# готовностью не печаталось ничего, и холодный старт большой модели (GigaChat3.1
+# — MoE на 6 ГБ, до трёх минут) был неотличим от зависшего процесса ни в логе,
+# ни в меню-баре. С номером этапа видно, что загрузка идёт и на чём именно стоит.
+LOAD_STAGES = ("VAD", "отпечаток голоса", "распознавание", "чистка", "прогрев")
+
+
+def load_stage(i: int, what: str):
+    """Отметить этап прогрева: строка в лог + состояние для меню и панели."""
+    now = time.time()
+    STATE["stage"] = (i, len(LOAD_STAGES), what)
+    STATE["stage_ts"] = now
+    print(f"  ⏳ {i}/{len(LOAD_STAGES)} {what}… (с начала {now - STATE['started']:.1f}с)",
+          flush=True)
+
+
+def stage_text() -> str:
+    """«4/5 чистка: Qwen3-4B, 2.3 ГБ — уже 12 с» для меню, панели и отказа по хоткею."""
+    st = STATE.get("stage")
+    if not st:
+        return "старт"
+    i, n, what = st
+    return f"{i}/{n} {what} — уже {time.time() - STATE['stage_ts']:.0f} с"
 
 ROLES = {  # роль -> (заголовок раздела, [(HF-репозиторий, ~полный размер МБ, подпись)])
     "asr": ("Распознавание", [
@@ -1246,23 +1271,33 @@ def load_llm(repo: str):
 def ml_worker(ready: threading.Event):
     import torch
     try:
+        load_stage(1, "VAD")
         from silero_vad import load_silero_vad, get_speech_timestamps
         vad = load_silero_vad(onnx=True)
+        load_stage(2, "отпечаток голоса")
         from speechbrain.inference.speaker import EncoderClassifier
         spk = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
                                              savedir=os.path.join(BASE, "models/ecapa"))
+        load_stage(3, f"распознавание: {ASR_MODEL.split('/')[-1]}")
         ModelHolder.get_model(ASR_MODEL, mx.float16)
         from mlx_lm import stream_generate
         from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+        # размер берём из ROLES: на большой модели этап идёт минутами, и человек
+        # должен видеть, что это норма, а не зависание
+        llm_mb = next((f for r, f, _ in ROLES["llm"][1] if r == LLM_MODEL), 0)
+        load_stage(4, f"чистка: {LLM_MODEL.split('/')[-1]}"
+                   + (f", ~{_fmt_mb(llm_mb)}" if llm_mb else ""))
         llm, tok = load_llm(LLM_MODEL)
         last_stats = {}  # заполняется llm_run: gen_tps, prompt_tps, gen_tokens
         pcache = {"cache": make_prompt_cache(llm), "tokens": []}  # KV-кэш префикса промпта
 
+        load_stage(5, "прогрев")
         for _ in stream_generate(llm, tok, prompt=tok.apply_chat_template(
                 [{"role": "user", "content": "ок"}], add_generation_prompt=True),
                 max_tokens=4):
             pass  # прогрев, чтобы первая диктовка была быстрой
         db = history_db()
+        print(f"✓ модели готовы за {time.time() - STATE['started']:.1f}с", flush=True)
     except Exception as e:
         # без моделей диктовать нечем: показываем причину в меню и окне
         # состояния (иначе иконка вечно «⏳», а нажатия копятся в очереди)
@@ -1827,9 +1862,10 @@ def start_recording():
         return
     if STATE["loading"]:
         # модели ещё греются: записанное всё равно вставится минут через
-        # несколько и не туда — честно отказываем сразу
-        print("  ⏳ модели ещё грузятся — диктовка будет доступна через несколько секунд",
-              flush=True)
+        # несколько и не туда — честно отказываем сразу. Называем этап и время:
+        # «через несколько секунд» на шестигигабайтной модели было обманом
+        print(f"  ⏳ модели ещё грузятся ({stage_text()}) — попробуй ещё раз, когда "
+              f"иконка сменится на 🎙️", flush=True)
         hud.play("error")
         return
     # флаг записи — сразу, проверка/оживление потока — в фоне: колбэки начнут
@@ -2479,8 +2515,9 @@ class DictateApp(rumps.App):
             svc = ("⚠️ Разрешения выданы, но не применены: " + ", ".join(need_restart)
                    + " — нажми «Перезапустить»")
         elif STATE["loading"]:
-            svc = ("⏳ Модели загружаются в память (после старта ~20–30 с, при первом "
-                   "запуске — скачиваются)")
+            svc = (f"⏳ Прогрев: {stage_text()}. Большие модели грузятся 1–3 минуты; "
+                   "при первом запуске ещё и скачиваются. Если номер этапа не меняется "
+                   "несколько минут — загрузка встала, поможет «Перезапустить»")
         elif recording:
             svc = "🔴 Идёт запись"
         elif stream_alive():
@@ -2720,9 +2757,16 @@ class DictateApp(rumps.App):
 
     def refresh_title(self, _):
         # ❌ — модели не загрузились; ⚠️ — поток мёртв/переоткрывается
-        title = ("❌" if STATE["error"] else "⏳" if STATE["loading"]
-                 else "🟠" if recording or enroll_buf["on"]
-                 else "🎙️" if stream_alive() else "⚠️")
+        if STATE["error"]:
+            title = "❌"
+        elif STATE["loading"]:
+            # номер этапа рядом с ⏳: видно, что прогрев идёт, а не встал
+            st = STATE.get("stage")
+            title = f"⏳{st[0]}/{st[1]}" if st else "⏳"
+        elif recording or enroll_buf["on"]:
+            title = "🟠"
+        else:
+            title = "🎙️" if stream_alive() else "⚠️"
         if title == "🎙️" and (update_available() or code_updated_on_disk()):
             title = "🎙️⬆️"  # есть что поставить/перезапустить — см. «О программе»
         if title != self.title:
