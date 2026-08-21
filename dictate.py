@@ -82,7 +82,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.15.1"
+VERSION = "0.15.2"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -2354,28 +2354,39 @@ class DictateApp(rumps.App):
 
     # --- о программе и обновления ---------------------------------------------
     def _build_about_menu(self):
-        """Обновления: одна строка — состояние, следующая — действие.
+        """Три группы: что установлено · обновления · обслуживание.
 
-        Раньше строка «Обновления» была и тем и другим сразу: первый клик
-        спрашивал GitHub, второй ставил, а между ними всплывало окно «нажми эту
-        строку ещё раз». Теперь на кнопке всегда написано, что произойдёт по
-        клику, а состояние живёт отдельной некликабельной строкой."""
+        Внутри каждой один и тот же порядок — сначала строка СОСТОЯНИЯ (серая,
+        не кликается), потом ДЕЙСТВИЯ над ним. Так уже было сделано с
+        обновлениями: раньше строка «Обновления» была и тем и другим сразу —
+        первый клик спрашивал GitHub, второй ставил, а между ними всплывало
+        окно «нажми эту строку ещё раз».
+
+        Версия жила по старому образцу: показывала состояние и молча копировала
+        справку по клику — узнать об этом было неоткуда. Теперь копирование —
+        отдельная строка, на которой написано, что она делает. Справка про
+        обновления переехала к обновлениям: после «Перезапустить службу» она
+        читалась как «как работает программа вообще»."""
         m = rumps.MenuItem(f"О программе · {VERSION}")
-        self.ver_item = rumps.MenuItem(f"Версия {app_version()}",
-                                       callback=self.copy_version)
-        self.upd_status = rumps.MenuItem("Обновления: …")  # без callback — просто строка
+        # без callback — некликабельные строки состояния
+        self.ver_item = rumps.MenuItem(f"Dictate {app_version()}")
+        self.upd_status = rumps.MenuItem("Обновления: …")
+        self.report_item = rumps.MenuItem("Скопировать данные для отчёта об ошибке",
+                                          callback=self.copy_version)
         self.upd_item = rumps.MenuItem(update_action_label(), callback=self.update_clicked)
-        self.restart_item = rumps.MenuItem("Перезапустить службу", callback=self.restart_clicked)
-        self.autoupd_item = rumps.MenuItem("Проверять обновления при запуске",
+        self.autoupd_item = rumps.MenuItem("Проверять при запуске",
                                            callback=self.toggle_auto_check)
         self.autoupd_item.state = int(bool(CONFIG.get("auto_check_updates")))
+        self.restart_item = rumps.MenuItem("Перезапустить службу", callback=self.restart_clicked)
         m.add(self.ver_item)
+        m.add(self.report_item)
+        m.add(None)
         m.add(self.upd_status)
         m.add(self.upd_item)
         m.add(self.autoupd_item)
+        m.add(rumps.MenuItem("Как обновляется Dictate…", callback=self.update_help))
         m.add(None)
         m.add(self.restart_item)
-        m.add(rumps.MenuItem("Как это работает…", callback=self.update_help))
         return m
 
     def refresh_about(self, _=None):
@@ -2389,8 +2400,10 @@ class DictateApp(rumps.App):
                 (self.about_item, f"О программе · {VERSION}{mark}"),
                 (self.upd_status, f"Обновления: {update_summary()}"),
                 (self.upd_item, update_action_label()),
-                (self.ver_item, f"Версия {app_version()}"
-                 + (" · ⬆️ на диске новее, нужен перезапуск" if stale else "")),
+                # вернуть подпись после «Скопировано ✓» — иначе она там и останется
+                (self.report_item, "Скопировать данные для отчёта об ошибке"),
+                (self.ver_item, f"Dictate {app_version()}"
+                 + (" · ⬆️ на диске новее" if stale else "")),
                 (self.restart_item, "⬆️ Перезапустить службу — на диске новее"
                  if stale else "Перезапустить службу")):
             if item.title != title:
@@ -3268,7 +3281,7 @@ class DictateApp(rumps.App):
             f"Микрофон: {STATE['mic']}",
         ])
         subprocess.run(["pbcopy"], input=info.encode())
-        self.ver_item.title = "Версия скопирована ✓"
+        self.report_item.title = "Скопировано ✓"
         rumps.Timer(self._restore_about, 2.0).start()
 
     def _restore_about(self, timer):
