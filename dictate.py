@@ -82,7 +82,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.15.0"
+VERSION = "0.15.1"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -1212,6 +1212,57 @@ def strip_short_period(text: str) -> str:
     return text
 
 
+# Whisper учился на субтитрах и на хвосте тишины дописывает титры из обучающих
+# данных. Ищем их ТОЛЬКО в самом конце: в середине такая фраза почти наверняка
+# настоящая («продолжение следует на следующей неделе»)
+TAIL_JUNK = ("продолжение следует", "субтитры сделал", "субтитры делал",
+             "субтитры создавал", "субтитры и перевод", "редактор субтитров",
+             "спасибо за просмотр", "подписывайтесь на канал", "ставьте лайки",
+             "thanks for watching", "thank you for watching",
+             "subtitles by", "amara.org")
+# Зацикливание: кусок повторяется подряд четыре раза и больше. Кусок берём
+# любой (`.`, а не `\w`), поэтому ловятся и СКЛЕЕННЫЕ повторы «ratosratos…»,
+# мимо которых счёт по словам проходил насквозь
+LOOP_RE = re.compile(r"(.{2,30}?)\1{3,}", re.S)
+LOOP_MIN = 12  # символов в петле: короче — это «ха-ха-ха-ха», а не галлюцинация
+
+
+def strip_loops(text: str) -> tuple[str, list[str]]:
+    """Вырезать из распознанного галлюцинации Whisper: петли и титры.
+
+    Петля («ratos» 220 раз, «secular secular…») и хвост «Продолжение
+    следует…» — не оговорка диктующего, а бред модели на тишине. Сторож ниже
+    считал повторы по СЛОВАМ: склеенную петлю он не видел вовсе, а когда
+    срабатывал — выбрасывал диктовку ЦЕЛИКОМ, вместе с нормальным началом
+    (49 секунд речи в мусор). Поэтому режем точечно, остальное едет дальше.
+
+    Возвращает (очищенный текст, что вырезали) — вырезанное идёт в лог."""
+    cut, out, pos = [], [], 0
+    for m in LOOP_RE.finditer(text):
+        if len(m.group(0)) < LOOP_MIN:
+            continue
+        out.append(text[pos:m.start()])
+        cut.append(f"«{m.group(1).strip()}»×{len(m.group(0)) // len(m.group(1))}")
+        pos = m.end()
+    out.append(text[pos:])
+    text = re.sub(r"\s{2,}", " ", "".join(out)).strip()
+    for _ in range(len(TAIL_JUNK)):  # титров может быть несколько подряд
+        low = text.lower()
+        for phrase in TAIL_JUNK:
+            i = low.rfind(phrase)
+            # титры сидят в САМОМ хвосте: после них — подпись автора и точки,
+            # не больше. Иначе срежем настоящую речь («продолжение следует на
+            # следующей неделе, я допишу отчёт»). i > 0 — на всю диктовку
+            # правило не распространяется: одну фразу целиком не выбрасываем
+            if i > 0 and len(text) - (i + len(phrase)) <= 20:
+                cut.append(text[i:].strip())
+                text = text[:i].rstrip(" \t,-–—")  # точку предложения оставляем
+                break
+        else:
+            break
+    return text.strip(), cut
+
+
 TRANSLATE_PROMPT = (
     "Translate the dictated Russian text into natural, fluent English. "
     "Keep the meaning, tone and technical terms. Output ONLY the translation."
@@ -1785,6 +1836,9 @@ def ml_worker(ready: threading.Event):
             except Exception as e:
                 print(f"  ошибка распознавания: {e}", flush=True)
                 continue
+            raw, cut = strip_loops(raw)  # петли и субтитровые титры — до всего
+            if cut:
+                print(f"  ✂ вырезал галлюцинацию: {', '.join(cut)[:160]}", flush=True)
             # слова, в которых Whisper сам не уверен, — кандидаты на ослышку.
             # Первое слово, короткие и частые слова не считаем: у них низкая
             # вероятность в норме, а «ремонт» по ним переписывает смысл
@@ -1795,6 +1849,7 @@ def ml_worker(ready: threading.Event):
                 core = re.sub(r"[^\wёЁ-]", "", word)
                 if (w["probability"] < 0.6 and i > 0 and len(core) >= 4
                         and core.lower() not in STOP_DOUBT
+                        and word in raw  # вырезанную петлю не «чиним»
                         and not re.search(r"\d", core)):  # числа не «чиним»
                     doubtful.append(word)
             t_asr = time.time() - t0
@@ -1810,7 +1865,8 @@ def ml_worker(ready: threading.Event):
                     and len(set(raw_words)) >= 2):
                 print(f"  ✗ похоже на эхо словаря, не вставляю: {raw}", flush=True)
                 continue
-            # зацикливание распознавания: одно слово подряд десятками раз.
+            # подстраховка на случай, если петля рассыпана по тексту и strip_loops
+            # её не увидел: одно слово подряд десятками раз.
             # Мало того что это мусор во вставке — строка ложится в историю,
             # автословарь тащит слово в initial_prompt, и Whisper выдаёт его
             # снова (так в словаре оказались «secular» и «actresses»)
