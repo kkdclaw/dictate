@@ -18,6 +18,11 @@ import tempfile
 import threading
 import time
 
+# Прогресс-бары huggingface_hub (tqdm) в файле лога превращаются в кашу из \r и
+# escape-кодов: строка «Fetching 13 files: 54%» замирает и читается как зависание,
+# а ни скорости, ни остатка в ней нет. Свой прогресс считает download_watch.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 import numpy as np
 import rumps
 import sounddevice as sd
@@ -82,7 +87,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.15.2"
+VERSION = "0.15.3"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
@@ -92,7 +97,8 @@ MIN_DURATION = 0.4  # сек; короче — случайное нажатие
 
 STATE = {"loading": True, "mic": "…", "enhance": True, "app": "", "error": "",
          "perms": {}, "last_hotkey": 0.0, "started": time.time(), "perms_ts": 0.0,
-         "stage": None, "stage_ts": 0.0, "llm_loaded": False}
+         "stage": None, "stage_ts": 0.0, "llm_loaded": False,
+         "stage_repo": None, "dl": None}
 
 # Этапы прогрева. Нужны не для красоты: раньше между «Прогреваю модели» и
 # готовностью не печаталось ничего, и холодный старт большой модели (GigaChat3.1
@@ -101,13 +107,72 @@ STATE = {"loading": True, "mic": "…", "enhance": True, "app": "", "error": "",
 LOAD_STAGES = ("VAD", "отпечаток голоса", "распознавание", "чистка", "прогрев")
 
 
-def load_stage(i: int, what: str):
-    """Отметить этап прогрева: строка в лог + состояние для меню и панели."""
+def load_stage(i: int, what: str, repo: str = "", full_mb: float = 0.0):
+    """Отметить этап прогрева: строка в лог + состояние для меню и панели.
+
+    repo — модель, которую этап берёт с HF. Пока её нет на диске, этап занят не
+    загрузкой в память на секунды, а скачиванием гигабайтов по сети, и человеку
+    это надо показывать иначе: см. download_watch."""
     now = time.time()
     STATE["stage"] = (i, len(LOAD_STAGES), what)
     STATE["stage_ts"] = now
+    STATE["stage_repo"] = (repo, full_mb) if repo else None
+    STATE["dl"] = None  # прогресс прошлого этапа к новому отношения не имеет
     print(f"  ⏳ {i}/{len(LOAD_STAGES)} {what}… (с начала {now - STATE['started']:.1f}с)",
           flush=True)
+
+
+def _fmt_eta(sec: float) -> str:
+    if sec <= 0:
+        return "сколько осталось — пока не ясно"
+    if sec < 90:
+        return f"осталось ~{sec:.0f} с"
+    if sec < 3600:
+        return f"осталось ~{sec / 60:.0f} мин"
+    return f"осталось ~{sec / 3600:.1f} ч"
+
+
+def dl_text(d: dict) -> str:
+    """«0.4 из ~1.6 ГБ (25%) · 0.5 МБ/с · осталось ~40 мин» — лог, меню, панель.
+
+    Годится и для записи _repo_status (там нет скорости) — тогда только размеры."""
+    if not d:
+        return ""
+    pct = f" ({min(99, d['mb'] / d['full'] * 100):.0f}%)" if d.get("full") else ""
+    size = f"{_fmt_mb(d['mb'])} из ~{_fmt_mb(d.get('full', 0))}{pct}"
+    speed = d.get("speed", 0.0)
+    if speed > 0.05:
+        return f"{size} · {speed:.1f} МБ/с · {_fmt_eta(d.get('eta', 0))}"
+    if "speed" not in d:
+        return size  # скорость ещё не мерили — не выдумываем ни её, ни остановку
+    idle = d.get("idle", 0)
+    if idle > 60:
+        return f"{size} · данные не идут уже {idle / 60:.0f} мин"
+    return f"{size} · считаю скорость…"
+
+
+def loading_status_text() -> str:
+    """Строка «служба» в окне состояния, пока диктовка не готова.
+
+    Скачивание и прогрев — разные ожидания: первое меряется гигабайтами и
+    минутами сети, второе — секундами чтения с диска. Совет «перезапустить»
+    уместен только во втором: перезапуск посреди закачки её лишь обрывает."""
+    st, d = STATE.get("stage"), STATE.get("dl")
+    if not d:
+        return (f"⏳ Прогрев: {stage_text()}. Модели уже на диске, идёт загрузка "
+                "в память: обычно 5–30 с, большие — 1–3 минуты. Если номер этапа "
+                "не меняется дольше — загрузка встала, поможет «Перезапустить»")
+    repo = (STATE.get("stage_repo") or ("", 0))[0].split("/")[-1]
+    # про остановку цифру уже назвал dl_text — здесь только что с ней делать
+    stuck = ("" if d.get("idle", 0) <= 60 else
+             " Проверь сеть или прокси: пока связь не вернётся, ждать бесполезно.")
+    return (f"⬇️ Скачиваю модель {repo} — {dl_text(d)}"
+            + (f" (этап {st[0]}/{st[1]})" if st else "") + ". "
+            "Модели берутся с huggingface.co один раз: при первом запуске и после "
+            "смены модели в меню. Диктовка заработает, когда закачка дойдёт до конца. "
+            "Перезапускать не надо: быстрее от этого не станет — после перезапуска "
+            "закачка продолжится с того же места, но время на переподключение "
+            "потеряется." + stuck)
 
 
 def stage_text() -> str:
@@ -116,6 +181,9 @@ def stage_text() -> str:
     if not st:
         return "старт"
     i, n, what = st
+    d = STATE.get("dl")
+    if d:  # качаем — «уже 12 с» тут бесполезно, важны проценты и остаток
+        return f"{i}/{n} {what} — скачиваю {dl_text(d)}"
     return f"{i}/{n} {what} — уже {time.time() - STATE['stage_ts']:.0f} с"
 
 ROLES = {  # роль -> (заголовок раздела, [(HF-репозиторий, ~полный размер МБ, подпись)])
@@ -145,6 +213,7 @@ ROLES = {  # роль -> (заголовок раздела, [(HF-репозит
     ]),
 }
 ROLE_CFG = {"asr": "asr_model", "llm": "llm_model"}  # роль -> ключ в config.json
+ECAPA = ("speechbrain/spkrec-ecapa-voxceleb", 90)  # отпечаток голоса: репо, ~МБ
 
 CONFIG_PATH = os.path.join(BASE, "config.json")
 VOICEPRINT_PATH = os.path.join(BASE, "voiceprint.npz")
@@ -351,9 +420,11 @@ def _repo_status(repo: str, full_mb, max_age=3.0) -> dict:
     # «скачана» — только если на месте веса и конфиг: HF кладёт симлинки по мере
     # загрузки, и прерванная закачка иначе выглядит готовой (а падает при старте)
     names = {os.path.basename(x) for x in snaps}
-    has_weights = any(n.endswith((".safetensors", ".npz", ".bin", ".gguf"))
+    has_weights = any(n.endswith((".safetensors", ".npz", ".bin", ".gguf",
+                                  ".ckpt", ".pt"))
                       for n in names)
-    has_cfg = any(n in ("config.json", "params.json") or n.endswith(".json")
+    has_cfg = any(n in ("config.json", "params.json")
+                  or n.endswith((".json", ".yaml", ".yml"))
                   for n in names)
     complete = has_weights and has_cfg
     if incomplete:
@@ -369,17 +440,75 @@ def _repo_status(repo: str, full_mb, max_age=3.0) -> dict:
     return st
 
 
-def _model_row(label: str, st: dict, active: bool) -> str:
+def _model_row(label: str, st: dict, active: bool, repo: str = "") -> str:
     mark = "●" if active else "○"
     if st["state"] == "done":
         size = _fmt_mb(st["mb"])
     elif st["state"] == "loading":
-        size = f"⏳ {_fmt_mb(st['mb'])} из ~{_fmt_mb(st['full'])}"
+        size = "⬇️ " + dl_text(DL.get(repo) or st)
     elif st["state"] == "partial":
         size = f"⚠️ скачана частично ({_fmt_mb(st['mb'])} из ~{_fmt_mb(st['full'])})"
     else:
         size = f"не скачана (~{_fmt_mb(st['full'])})"
     return f"{mark} {label} · {size}"
+
+
+def _full_mb(role: str, repo: str) -> float:
+    """Ожидаемый размер модели из ROLES — знать его надо до того, как она скачана."""
+    return next((f for r, f, _ in ROLES[role][1] if r == repo), 0)
+
+
+DL = {}  # repo -> {"mb", "full", "speed", "eta"}; заполняет download_watch
+
+
+def download_watch():
+    """Считает прогресс скачивания моделей: проценты, скорость, остаток.
+
+    Первый старт на новой машине — это не «прогрев 1–3 минуты», а несколько
+    гигабайтов по сети (через туннель — часы). Без цифр он неотличим от
+    зависшего процесса: этап стоит на «3/5 распознавание», в логе тишина, и
+    единственное, что хочется сделать, — перезапустить, обнулив закачку.
+    Размер считаем по кэшу HF на диске: hf_hub наружу свой прогресс не отдаёт,
+    зато незавершённые блобы в кэше растут по мере закачки."""
+    hist, last_log, grew = {}, {}, {}  # hist: repo -> точки (время, МБ) за 3 мин
+    while True:
+        time.sleep(2)
+        watched = {}
+        tgt = STATE.get("stage_repo")
+        if STATE["loading"] and tgt:
+            watched[tgt[0]] = tgt[1]
+        for role, cfg_key in ROLE_CFG.items():
+            watched.setdefault(CONFIG[cfg_key], _full_mb(role, CONFIG[cfg_key]))
+        watched.setdefault(*ECAPA)
+        for repo, full in watched.items():
+            st = _repo_status(repo, full, max_age=0)
+            if st["state"] != "loading":
+                DL.pop(repo, None)
+                hist.pop(repo, None)
+                grew.pop(repo, None)
+                continue
+            now, mb = time.time(), st["mb"]
+            d = DL.get(repo)
+            if d is None or mb > d["mb"] + 0.01:
+                grew[repo] = now  # засечка роста: по ней отличаем медленно от «встало»
+            # скорость — по трёхминутному окну, а не по соседним замерам:
+            # hf_xet сбрасывает скачанное на диск кусками в десятки мегабайт, и
+            # между сбросами размер стоит. На коротком окне это выглядит как
+            # чередование «сеть молчит» и «2.8 МБ/с», а остаток пляшет вместе
+            h = hist.setdefault(repo, collections.deque())
+            h.append((now, mb))
+            while len(h) > 2 and now - h[0][0] > 180:
+                h.popleft()
+            speed = ((mb - h[0][1]) / (now - h[0][0])) if now - h[0][0] >= 20 else 0.0
+            speed = max(0.0, speed)
+            left = max(0.0, full - mb)
+            DL[repo] = {"mb": mb, "full": full, "speed": speed,
+                        "eta": left / speed if speed > 0.05 else 0.0,
+                        "idle": now - grew.get(repo, now)}
+            if now - last_log.get(repo, 0) >= 30:  # в лог редко: он и так растёт
+                last_log[repo] = now
+                print(f"  ⬇️ {repo.split('/')[-1]}: {dl_text(DL[repo])}", flush=True)
+        STATE["dl"] = DL.get(tgt[0]) if (STATE["loading"] and tgt) else None
 
 
 def style_for(app: str) -> str:
@@ -1366,17 +1495,18 @@ def ml_worker(ready: threading.Event):
         load_stage(1, "VAD")
         from silero_vad import load_silero_vad, get_speech_timestamps
         vad = load_silero_vad(onnx=True)
-        load_stage(2, "отпечаток голоса")
+        load_stage(2, "отпечаток голоса", *ECAPA)
         from speechbrain.inference.speaker import EncoderClassifier
-        spk = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
+        spk = EncoderClassifier.from_hparams(source=ECAPA[0],
                                              savedir=os.path.join(BASE, "models/ecapa"))
-        load_stage(3, f"распознавание: {ASR_MODEL.split('/')[-1]}")
+        load_stage(3, f"распознавание: {ASR_MODEL.split('/')[-1]}",
+                   ASR_MODEL, _full_mb("asr", ASR_MODEL))
         ModelHolder.get_model(ASR_MODEL, mx.float16)
         from mlx_lm import stream_generate
         from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
         # размер берём из ROLES: на большой модели этап идёт минутами, и человек
         # должен видеть, что это норма, а не зависание
-        llm_mb = next((f for r, f, _ in ROLES["llm"][1] if r == LLM_MODEL), 0)
+        llm_mb = _full_mb("llm", LLM_MODEL)
         # Модель чистки живёт в держателе L, а не в двух переменных: её можно
         # выгружать. Смысл — память: 4 ГБ заняты постоянно ради правки, которая
         # нужна примерно раз на шесть диктовок (LLM включается по regex-фильтру
@@ -1434,11 +1564,12 @@ def ml_worker(ready: threading.Event):
 
         if CONFIG["unload_llm"]:
             load_stage(4, f"чистка: {LLM_MODEL.split('/')[-1]} — по требованию, "
-                          "в память сейчас не берём")
+                          "в память сейчас не берём", LLM_MODEL, llm_mb)
             load_stage(5, "прогрев: без модели чистки не нужен")
         else:
             load_stage(4, f"чистка: {LLM_MODEL.split('/')[-1]}"
-                       + (f", ~{_fmt_mb(llm_mb)}" if llm_mb else ""))
+                       + (f", ~{_fmt_mb(llm_mb)}" if llm_mb else ""),
+                       LLM_MODEL, llm_mb)
             llm_load(warm_stage=True)
         db = history_db()
         print(f"✓ модели готовы за {time.time() - STATE['started']:.1f}с", flush=True)
@@ -2820,9 +2951,7 @@ class DictateApp(rumps.App):
             svc = ("⚠️ Разрешения выданы, но не применены: " + ", ".join(need_restart)
                    + " — нажми «Перезапустить»")
         elif STATE["loading"]:
-            svc = (f"⏳ Прогрев: {stage_text()}. Большие модели грузятся 1–3 минуты; "
-                   "при первом запуске ещё и скачиваются. Если номер этапа не меняется "
-                   "несколько минут — загрузка встала, поможет «Перезапустить»")
+            svc = loading_status_text()
         elif recording:
             svc = "🔴 Идёт запись"
         elif stream_alive():
@@ -2890,8 +3019,11 @@ class DictateApp(rumps.App):
             if st["state"] == "done":
                 txt, btn, act = f"● скачана · {_fmt_mb(st['mb'])} · {label}", "Папка", f"dir:{role}"
             elif st["state"] == "loading":
-                txt, btn, act = (f"⏳ скачивается: {_fmt_mb(st['mb'])} из ~{_fmt_mb(full)} · {label}",
-                                 None, None)
+                d = DL.get(repo)
+                txt, btn, act = (f"⬇️ скачивается: "
+                                 + (dl_text(d) if d else
+                                    f"{_fmt_mb(st['mb'])} из ~{_fmt_mb(full)}")
+                                 + f" · {label}", None, None)
             elif st["state"] == "partial":
                 txt, btn, act = (f"⚠️ скачана частично ({_fmt_mb(st['mb'])} из ~{_fmt_mb(full)}) · "
                                  f"{label} — закачка обрывалась", "Докачать", f"dl:{role}")
@@ -2913,10 +3045,13 @@ class DictateApp(rumps.App):
                       + f" · в подсказку ушло {len(hint.split(', '))} терминов, "
                       + f"{tok_len(hint)} из {HINT_TOKENS} токенов\n"
                       + f"первые: {hint[:90]}…", "Открыть…", "terms"))
-        ec = _repo_status("speechbrain/spkrec-ecapa-voxceleb", 90)
+        ec = _repo_status(*ECAPA)
         ec_txt = ("● " + _fmt_mb(ec["mb"]) if ec["state"] == "done"
-                  else "⏳ скачивается" if ec["state"] == "loading" else "○ не скачан (~90 МБ)")
-        vad_txt = "● загружен" if not STATE["loading"] else "⏳"
+                  else "⬇️ " + dl_text(DL.get(ECAPA[0]) or ec) if ec["state"] == "loading"
+                  else f"⚠️ скачан частично ({_fmt_mb(ec['mb'])} из ~{_fmt_mb(ECAPA[1])})"
+                  if ec["state"] == "partial"
+                  else f"○ не скачан (~{_fmt_mb(ECAPA[1])})")
+        vad_txt = "● загружен" if not STATE["loading"] else "⏳ грузится"
         mrows.append(("Служебные", f"Отпечаток голоса ECAPA: {ec_txt} · Silero VAD: {vad_txt}",
                       "Открыть кэш", "cache"))
         # --- хоткей ---
@@ -2959,7 +3094,7 @@ class DictateApp(rumps.App):
                         for repo, full, label in options]
                 snapshot.append((role, title, rows))
             aux = [("ECAPA-voxceleb — отпечаток голоса",
-                    _repo_status("speechbrain/spkrec-ecapa-voxceleb", 90))]
+                    _repo_status(*ECAPA))]
             try:  # Silero VAD едет внутри pip-пакета, отдельно не скачивается
                 import silero_vad
                 d = os.path.dirname(silero_vad.__file__)
@@ -2987,7 +3122,7 @@ class DictateApp(rumps.App):
             role_item = rumps.MenuItem(
                 f"{title}: {CONFIG[ROLE_CFG[role]].split('/')[-1]}")
             for repo, label, st, is_active in rows:
-                row = rumps.MenuItem(_model_row(label, st, is_active))
+                row = rumps.MenuItem(_model_row(label, st, is_active, repo))
                 if is_active:
                     row.add(rumps.MenuItem("Активная модель"))
                 elif st["state"] == "done":
@@ -3080,9 +3215,15 @@ class DictateApp(rumps.App):
         if STATE["error"]:
             title = "❌"
         elif STATE["loading"]:
-            # номер этапа рядом с ⏳: видно, что прогрев идёт, а не встал
+            # ⏳ с номером этапа читается как «сейчас поедет» — верно, когда модели
+            # на диске и идёт загрузка в память. Пока они качаются, это неправда:
+            # там сеть на десятки минут, и показывать надо проценты скачивания
+            d = STATE.get("dl")
             st = STATE.get("stage")
-            title = f"⏳{st[0]}/{st[1]}" if st else "⏳"
+            if d and d["full"]:
+                title = f"⬇️{min(99, d['mb'] / d['full'] * 100):.0f}%"
+            else:
+                title = f"⏳{st[0]}/{st[1]}" if st else "⏳"
         elif recording or enroll_buf["on"]:
             title = "🟠"
         else:
@@ -3962,6 +4103,7 @@ def main():
     print(f"Прогреваю модели ({ASR_MODEL.split('/')[-1]} + {LLM_MODEL.split('/')[-1]})...")
     ready = threading.Event()
     threading.Thread(target=ml_worker, args=(ready,), daemon=True).start()
+    threading.Thread(target=download_watch, daemon=True).start()
     threading.Thread(target=_open_stream_quiet, daemon=True).start()
     hud.watch_default_output()  # AirPods подключили — звуки сразу мимо них
     threading.Thread(target=mic_watcher, daemon=True).start()
