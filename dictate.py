@@ -525,6 +525,14 @@ rec_seq = [0]  # номер текущей записи: капсулу пряч
 lock = threading.Lock()
 jobs = queue.Queue()  # аудио -> единственный ML-поток (MLX не переживает смену потока)
 stream_holder = {}  # текущий InputStream; пересоздаётся при смене устройства/тишине
+# «Живой» поток может отдавать одни нули: Bluetooth-линк AirPods уснул за время
+# простоя (наушники ушли на iPhone / в кейс), а CoreAudio продолжает звать
+# колбэк — пульс есть, звука нет. Живой микрофон (AirPods, встроенный) даже
+# в тихой комнате даёт пик ≥ 1e-3 на 15-мс блок, замер 24.08.2026 на Studio;
+# нули — только у мёртвого линка.
+SILENT_PEAK = 1e-4      # блок тише этого считаем нулями
+SILENT_DEAD_SEC = 3.0   # столько нулей подряд при живом пульсе — переоткрываем по нажатию
+SILENT_WATCH_SEC = 20.0  # вочдог переоткрывает сам после стольких секунд нулей, ОДИН раз на эпизод
 
 
 import ctypes
@@ -712,9 +720,13 @@ def _pa_recycle():
         print(f"  PortAudio не переинициализировался: {e}", flush=True)
 
 
-def reopen_stream(follow_default=False):
+def reopen_stream(follow_default=False, force=False):
     """Полный перезапуск аудио: закрыть поток, перечитать устройства CoreAudio,
     открыть заново. Возвращает False, если переоткрывать было нечего.
+
+    force — переоткрыть даже живой по пульсу поток: он может отдавать нули
+    (уснувший Bluetooth-линк), и без force вызов после «запись пустая» и по
+    кнопке «Переоткрыть поток» был холостым.
 
     Вочдог и вотчер смены входа просыпаются от одного события (AirPods достали
     из кейса) и раньше переоткрывали поток дважды подряд — в логе шли два
@@ -722,7 +734,7 @@ def reopen_stream(follow_default=False):
     первую секунду речи. Второй переоткрыватель теперь видит живой поток на том
     же входе и уходит ни с чем."""
     with reopen_lock:
-        if stream_alive():
+        if stream_alive() and not force:
             if not follow_default:
                 return False  # поток ожил, пока ждали замок (вочдог)
             try:
@@ -749,17 +761,35 @@ def stream_alive() -> bool:
         return False
 
 
+def mic_silent_for() -> float:
+    """Сколько секунд подряд поток отдаёт нули (пик блока < SILENT_PEAK); 0 — звук есть."""
+    last = stream_holder.get("last_signal")
+    if last is None:
+        return 0.0
+    return max(0.0, time.time() - last)
+
+
+def _fmt_secs(sec: float) -> str:
+    return f"{sec / 60:.0f} мин" if sec >= 120 else f"{sec:.0f} с"
+
+
 def ensure_stream():
-    """Перед записью: если поток умер или пульс пропал (микрофон отвалился) — переоткрыть."""
-    if stream_alive():
+    """Перед записью: если поток умер, пульс пропал (микрофон отвалился) или
+    поток жив, но отдаёт нули (Bluetooth-линк уснул за простой) — переоткрыть."""
+    silent = mic_silent_for()
+    if stream_alive() and silent < SILENT_DEAD_SEC:
         return
     if reopen_lock.busy():
         return  # кто-то уже переоткрывает — не вставать в очередь
-    print("  микрофон пропал — переоткрываю...", flush=True)
+    if stream_alive():
+        print(f"  микрофон отдаёт нули уже {_fmt_secs(silent)} (Bluetooth-линк уснул "
+              f"за простой?) — переоткрываю...", flush=True)
+    else:
+        print("  микрофон пропал — переоткрываю...", flush=True)
     try:
         # follow_default: без проб устройств, окно потери звука минимально;
-        # если дефолт окажется мёртвым, сработает фолбэк по тихой записи
-        reopen_stream(follow_default=True)
+        # если дефолт окажется мёртвым, сработает фолбэк по пустой записи
+        reopen_stream(follow_default=True, force=True)
     except NoMicrophone:
         STATE["mic"] = "нет — подключи микрофон"
         print("  микрофона нет — запись не пойдёт, подключи AirPods или USB-микрофон",
@@ -787,6 +817,7 @@ def open_stream(follow_default=False):
         s.start()
         stream_holder["stream"] = s
         stream_holder["name"] = name  # для дедупликации переоткрытий
+        stream_holder["last_signal"] = time.time()  # отсчёт нулей — с открытия
         try:  # список входов для окна состояния — обновляем, пока PortAudio наш
             _devices_cache["names"] = [d["name"] for d in sd.query_devices()
                                        if d["max_input_channels"] > 0]
@@ -821,10 +852,31 @@ def stream_watchdog():
     last_err = None
     while True:
         time.sleep(WAIT_POLL_SEC if waiting else min(30.0, 3.0 * (fails + 1)))
+        back = stream_holder.pop("silence_report", None)
+        if back:  # печатаем здесь, а не из аудио-колбэка (там I/O нельзя)
+            print(f"  микрофон снова отдаёт звук после {_fmt_secs(back)} нулей", flush=True)
         if recording or stream_alive() or reopen_lock.busy():
             fails = 0
             waiting = False
             last_err = None
+            silent = mic_silent_for()
+            if (not recording and stream_alive() and silent >= SILENT_WATCH_SEC
+                    and not stream_holder.get("silent_reopened")):
+                # поток жив по пульсу, но давно отдаёт нули: Bluetooth-линк уснул.
+                # Переоткрываем ОДИН раз на эпизод: если и после этого нули —
+                # наушники на другом устройстве/в кейсе, дёргать их каждые 20 с
+                # нельзя (A2DP↔HFP щёлкает, отбирает у iPhone). Дальше — по нажатию
+                # (ensure_stream) или по событию «сменился вход» (mic_watcher).
+                # Флаг снимается в колбэке, когда звук вернулся
+                stream_holder["silent_reopened"] = True
+                print(f"  микрофон {_fmt_secs(silent)} отдаёт нули при живом потоке — "
+                      f"переоткрываю один раз...", flush=True)
+                try:
+                    reopen_stream(follow_default=True, force=True)
+                except NoMicrophone:
+                    STATE["mic"] = "нет — подключи микрофон"
+                except Exception as e:
+                    print(f"  не удалось переоткрыть: {e}", flush=True)
             continue
         with reopen_lock:  # перечитка списка устройств, сериализовано
             _pa_recycle()
@@ -1039,7 +1091,19 @@ def paste_text(text: str) -> None:
     замок отпускается там же, поэтому следующая вставка дождётся возврата.
     Если за это время человек сам что-то скопировал (changeCount ушёл) —
     ничего не трогаем: его копия важнее нашего снимка."""
-    _paste_lock.acquire()
+    # Замок с таймаутом: если возврат буфера прошлой вставки завис (pasteboard-
+    # сервер не отвечает — так было при дедлоке WindowServer 24.08.2026),
+    # раньше ВСЕ следующие вставки ждали его вечно: запись идёт, текст не
+    # появляется, помогал только рестарт. Теперь ждём 3 с и вставляем без замка
+    own = _paste_lock.acquire(timeout=3.0)
+    if not own:
+        print("  ⚠ прошлая вставка не отпустила буфер за 3 с — вставляю, не дожидаясь",
+              flush=True)
+
+    def _release():
+        if own:
+            _paste_lock.release()
+
     keep = bool(CONFIG.get("restore_clipboard", True))
     try:
         pb = NSPasteboard.generalPasteboard()
@@ -1054,10 +1118,10 @@ def paste_text(text: str) -> None:
             Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskCommand)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
     except Exception:
-        _paste_lock.release()
+        _release()
         raise
     if not keep:
-        _paste_lock.release()
+        _release()
         return
 
     def _restore_later():
@@ -1069,7 +1133,7 @@ def paste_text(text: str) -> None:
         except Exception as e:
             print(f"  буфер обмена не восстановлен: {e}", flush=True)
         finally:
-            _paste_lock.release()
+            _release()
     threading.Thread(target=_restore_later, daemon=True).start()
 
 
@@ -1239,6 +1303,12 @@ overflow_sent = [False]  # авто-стоп ставится один раз н
 def audio_callback(indata, frames, t, status):
     now = time.time()
     stream_holder["last_cb"] = now  # пульс: колбэки идут, пока устройство живо
+    if indata.size and float(np.abs(indata).max()) >= SILENT_PEAK:
+        last = stream_holder.get("last_signal")
+        if last is not None and now - last >= SILENT_DEAD_SEC:
+            stream_holder["silence_report"] = now - last  # вочдог напишет в лог
+        stream_holder["last_signal"] = now  # звук есть: нули не копятся
+        stream_holder["silent_reopened"] = False
     overflow = False
     with lock:
         preroll.append((now, indata.copy()))
@@ -1900,10 +1970,15 @@ def ml_worker(ready: threading.Event):
             duration = len(audio) / SAMPLE_RATE
             rms = float(np.sqrt((audio ** 2).mean()))
             if rms < 1e-4:
-                print("  ✗ запись тихая (AirPods в кейсе? крышка закрыта?) — "
-                      "ищу живой микрофон, попробуй ещё раз", flush=True)
+                silent = mic_silent_for()
+                since = (f", нули шли уже {_fmt_secs(silent)}" if silent > duration + 1
+                         else "")
+                print(f"  ✗ запись пустая: микрофон «{STATE['mic']}» отдавал нули всю "
+                      f"запись{since} (Bluetooth-линк уснул за простой? AirPods в кейсе "
+                      f"или на другом устройстве?) — переоткрываю поток, скажи ещё раз "
+                      f"через пару секунд", flush=True)
                 try:
-                    reopen_stream()
+                    reopen_stream(force=True)  # force: по пульсу поток «жив», без него холостой
                 except Exception as e:
                     print(f"  не удалось переоткрыть: {e}", flush=True)
                 continue
@@ -2888,7 +2963,8 @@ class DictateApp(rumps.App):
             "update": lambda: self.update_clicked(None),
             "log": lambda: self.open_log(None),
             "hotkey": lambda: self.capture_hotkey(None),
-            "reopen": lambda: threading.Thread(target=reopen_stream, daemon=True).start(),
+            "reopen": lambda: threading.Thread(target=reopen_stream, kwargs={"force": True},
+                                               daemon=True).start(),
             "reveal": reveal_binary,
             "cache": lambda: subprocess.run(["open", os.path.dirname(_repo_dir("x/y"))]),
             "perm:Микрофон": lambda: request_permission("Микрофон"),
