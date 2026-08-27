@@ -90,7 +90,9 @@ sys.stderr = _StampedOut(sys.stderr)
 VERSION = "0.15.4"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
-LANGUAGE = None  # None = автоопределение; "ru" — жёстко русский
+# Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
+# Фиксированный язык экономит проход детекции (~1 с на M4 Air, ~0.25 с на Studio).
+ASR_LANGUAGES = [("ru", "Русский"), ("en", "English"), ("", "Автоопределение")]
 HK = hotkey.parse(hotkey.DEFAULT)  # горячая клавиша; перечитывается из config.json в load_config
 SAMPLE_RATE = 16000
 MIN_DURATION = 0.4  # сек; короче — случайное нажатие, игнорируем
@@ -233,6 +235,7 @@ STYLES = {  # ключ -> подпись в меню
 }
 CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "translate_all": False, "vp_threshold": 0.40, "enhance": True,
+          "asr_language": "ru",          # "ru" | "en" | "" — автоопределение (медленнее на ~1 с)
           "asr_model": ASR_MODEL, "llm_model": LLM_MODEL,
           "hotkey": hotkey.DEFAULT,      # см. hotkey.py: «alt_r», «fn», «ctrl+space», «cmd+shift+d»…
           "restore_clipboard": True,     # после вставки вернуть в буфер то, что там лежало
@@ -324,6 +327,8 @@ def load_config():
                                 if isinstance(a, str) and isinstance(l, str)}
     if not isinstance(CONFIG.get("default_terms"), str):
         CONFIG["default_terms"] = ""
+    if CONFIG.get("asr_language") not in {code for code, _ in ASR_LANGUAGES}:
+        CONFIG["asr_language"] = "ru"
     # ровно REVIEW_SLOTS ячеек. Мусор и дубли превращаем в выключенную ячейку,
     # а не в «какой-нибудь стиль»: пусть окно будет короче, чем со случайной строкой
     slots = CONFIG.get("review_styles")
@@ -1869,6 +1874,8 @@ def ml_worker(ready: threading.Event):
         rtf = rec["duration"] / t_asr if t_asr else 0
         pick = " ✓выбран" if rec.get("picked") else ""
         lay = f" словарь:{rec['layer']}" if rec.get("layer") else ""
+        lang = rec.get("lang", "ru")
+        lay += f" язык:{lang or 'auto'}" if lang != "ru" else ""
         print(f"  [{rec['duration']:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
               f"llm {rec['llm_ms'] / 1000:.1f}s{speed}{vp}{lay} → {rec['app']}/"
               f"{rec['style']}{pick}] {text}{mark}{doubt}", flush=True)
@@ -2036,7 +2043,8 @@ def ml_worker(ready: threading.Event):
             t0 = time.time()
             try:
                 result = mlx_whisper.transcribe(
-                    audio, path_or_hf_repo=ASR_MODEL, language=LANGUAGE,
+                    audio, path_or_hf_repo=ASR_MODEL,
+                    language=CONFIG["asr_language"] or None,
                     initial_prompt=asr_hint(app) or None, word_timestamps=True)
                 raw = result["text"].strip()
             except Exception as e:
@@ -2118,7 +2126,7 @@ def ml_worker(ready: threading.Event):
                    "app": app, "style": style, "layer": layer, "asr_ms": round(t_asr * 1000),
                    "llm_ms": round(t_llm * 1000), "gen_tps": last_stats.get("gen_tps"),
                    "gen_tokens": last_stats.get("gen_tokens"), "vp_sim": vp_sim,
-                   "doubtful": list(doubtful)}
+                   "doubtful": list(doubtful), "lang": CONFIG["asr_language"]}
             if CONFIG["review"] and not cmd:
                 # с голосовой командой окно не показываем: команда («отправь»,
                 # «удали») выполняется сразу после вставки, а вставка тут уезжает
@@ -2421,6 +2429,12 @@ class DictateApp(rumps.App):
         self.review_menu = self._build_review_menu()
         self.translate_item = rumps.MenuItem("Перевод → EN (везде)", callback=self.toggle_translate)
         self.translate_item.state = int(CONFIG["translate_all"])
+        self.lang_menu = rumps.MenuItem("Язык распознавания")
+        for code, label in ASR_LANGUAGES:
+            it = rumps.MenuItem(label, callback=self.set_language)
+            it._lang = code
+            it.state = int(code == CONFIG["asr_language"])
+            self.lang_menu.add(it)
         self.voice_menu = self._build_voice_menu()
 
         self.terms_menu = self._build_terms_menu()
@@ -2442,7 +2456,7 @@ class DictateApp(rumps.App):
 
         self.menu = [self.status_item, self.perm_item, self.mic_item, self.recent, None,
                      self.profile, self.default_style, self.review_menu,
-                     self.translate_item, None,
+                     self.translate_item, self.lang_menu, None,
                      self.voice_menu,
                      None,
                      self.hotkey_menu,
@@ -3337,6 +3351,13 @@ class DictateApp(rumps.App):
     def set_default_style(self, sender):
         CONFIG["default_style"] = sender._style_key
         save_config()
+
+    def set_language(self, sender):
+        CONFIG["asr_language"] = sender._lang
+        for it in self.lang_menu.values():
+            it.state = int(it._lang == sender._lang)
+        save_config()
+        print(f"  язык распознавания: {sender.title}", flush=True)
 
     def toggle_translate(self, sender):
         CONFIG["translate_all"] = not CONFIG["translate_all"]
