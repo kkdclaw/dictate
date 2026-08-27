@@ -66,7 +66,25 @@ def compute(rs):
     asr_ms = [col(r, "asr_ms") for r in rs if col(r, "asr_ms")]
     llm_ms = [col(r, "llm_ms") for r in rs if col(r, "llm_ms")]
     avg = lambda xs: round(sum(xs) / len(xs)) if xs else 0
+
+    def median(xs):
+        xs = sorted(xs)
+        return xs[len(xs) // 2] if xs else 0
+    # хронология скорости: по дням медиана времени ASR и медиана длины фразы.
+    # Медиана, а не среднее: одна 60-секундная диктовка не должна портить день
+    perf = defaultdict(lambda: ([], []))  # date -> ([asr_ms], [duration])
+    for r in rs:
+        if col(r, "asr_ms"):
+            d = datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d")
+            perf[d][0].append(col(r, "asr_ms"))
+            perf[d][1].append(r["duration"] or 0)
+    perf_days = [(d, round(median(a) / 1000, 1), round(median(dur), 1), len(a))
+                 for d, (a, dur) in sorted(perf.items())]
+    today = datetime.now().strftime("%Y-%m-%d")
     return {
+        "asr_ms_med": median(asr_ms), "asr_ms_today": median(perf[today][0]) if today in perf else 0,
+        "perf_days": perf_days,
+        "asr_series": list(reversed(asr_ms))[-60:],  # хронологически, последние 60
         "total": total, "words": words, "secs": secs, "corrected": corrected,
         "corr_rate": round(100 * corrected / total) if total else 0,
         "avg_words": round(words / total, 1) if total else 0,
@@ -86,7 +104,20 @@ def search_data(rs):
         "app": r["app"] or "?",
         "text": r["text"] or "",
         "raw": (r["raw_text"] or "") if (r["raw_text"] or "") != (r["text"] or "") else "",
+        "asr": _asr_label(r),
     } for r in rs]
+
+
+def _asr_label(r) -> str:
+    """«6.3 с → 1.8 с» — длина фразы и время распознавания; пусто, если замера нет."""
+    try:
+        ms = r["asr_ms"]
+    except (IndexError, KeyError):
+        return ""
+    if not ms:
+        return ""
+    return f'{r["duration"] or 0:.1f} с → {ms / 1000:.1f} с'
+
 
 
 # ————— SVG-примитивы (палитра из dataviz-гайда) —————
@@ -143,6 +174,38 @@ def timeline(by_day):
                        f'rx="4" fill="var(--accent)"><title>{corr} исправлено</title></rect>')
         if n <= 20 or i % 2 == 0:
             svg.append(f'<text x="{x+bw/2}" y="{h-pad+14}" text-anchor="middle" '
+                       f'class="tick">{day[8:]}.{day[5:7]}</text>')
+    svg.append("</svg>")
+    return "".join(svg)
+
+
+def perf_timeline(days):
+    """Пары столбиков по дням: медианная длина фразы (светлый) и медианное
+    время распознавания (тёмный), обе в секундах. Тёмный выше светлого —
+    распознавание медленнее реального времени."""
+    if not days:
+        return '<p class="empty">нет замеров</p>'
+    w, h, pad = 620, 180, 28
+    n = len(days)
+    mx = max(max(a, d) for _, a, d, _ in days) or 1
+    slot = (w - pad) / max(n, 1)
+    bw = min(14, slot * 0.36)
+    svg = [f'<svg viewBox="0 0 {w} {h}" class="chart">']
+    for gy in (0, 0.5, 1):
+        yy = pad + (h - 2*pad) * (1 - gy)
+        svg.append(f'<line x1="{pad}" y1="{yy}" x2="{w}" y2="{yy}" class="grid"/>')
+        svg.append(f'<text x="2" y="{yy+4}" class="tick">{round(mx*gy, 1)}</text>')
+    for i, (day, asr, dur, cnt) in enumerate(days):
+        x = pad + slot * i + (slot - 2*bw - 2) / 2
+        hd = (h - 2*pad) * dur / mx
+        ha = (h - 2*pad) * asr / mx
+        tip = f'{day[8:]}.{day[5:7]}: фраза {dur} с, распознавание {asr} с ({cnt} шт.)'
+        svg.append(f'<rect x="{x}" y="{h-pad-hd}" width="{bw}" height="{max(0, hd)}" rx="3" '
+                   f'fill="var(--series2)"><title>{tip}</title></rect>')
+        svg.append(f'<rect x="{x+bw+2}" y="{h-pad-ha}" width="{bw}" height="{max(0, ha)}" rx="3" '
+                   f'fill="var(--series)"><title>{tip}</title></rect>')
+        if n <= 20 or i % 2 == 0:
+            svg.append(f'<text x="{x+bw+1}" y="{h-pad+14}" text-anchor="middle" '
                        f'class="tick">{day[8:]}.{day[5:7]}</text>')
     svg.append("</svg>")
     return "".join(svg)
@@ -244,11 +307,21 @@ def build(active="stats"):
       <h2 class="sec">Производительность</h2>
       <div class="tiles">
         {tile("Скорость генерации LLM", s["gen_tps_avg"] or "—", "токенов/с в среднем")}
-        {tile("Распознавание", f'{s["asr_ms_avg"]} мс' if s["asr_ms_avg"] else "—", "на фразу")}
+        {tile("Распознавание", f'{s["asr_ms_med"]} мс' if s["asr_ms_med"] else "—",
+              f'медиана на фразу · сегодня {s["asr_ms_today"]} мс' if s["asr_ms_today"]
+              else "медиана на фразу")}
         {tile("LLM-чистка", f'{s["llm_ms_avg"]} мс' if s["llm_ms_avg"] else "—",
               "когда включается")}
         {tile("Модели", "MLX", "Whisper + Qwen на GPU")}
       </div>
+      <div class="card"><h3>Распознавание по дням
+        <span class="key"><i class="sw2"></i>длина фразы, с <i class="sw1"></i>время ASR, с</span></h3>
+        {perf_timeline(s["perf_days"])}
+        <p class="note">Медианы за день. Тёмный столбик выше светлого — распознавание
+          идёт дольше самой фразы; для одной машины смотри тренд, для разных — сравни высоту.</p></div>
+      <div class="card"><h3>Распознавание по фразам
+        <span class="key">мс, последние {len(s["asr_series"])}</span></h3>
+        {sparkline(s["asr_series"], " мс")}</div>
       <div class="card"><h3>Скорость генерации LLM по фразам
         <span class="key">токенов/с, последние {len(s["tps_series"])}</span></h3>
         {sparkline(s["tps_series"], " т/с")}</div>'''
@@ -298,7 +371,7 @@ main{max-width:1320px;margin:0 auto;padding:22px 28px 60px}
   justify-content:space-between;align-items:center;gap:12px}
 .key{font-weight:400;color:var(--muted);font-size:12px;display:flex;gap:10px;align-items:center}
 .key i{display:inline-block;width:12px;height:8px;border-radius:2px;vertical-align:middle;margin-right:3px}
-.sw2{background:var(--series2)}.swa{background:var(--accent)}
+.sw1{background:var(--series)}.sw2{background:var(--series2)}.swa{background:var(--accent)}
 .chart{width:100%;height:auto;overflow:visible}
 .lbl{fill:var(--ink2);font-size:13px}.val{fill:var(--ink);font-size:13px;font-weight:600}
 .tick{fill:var(--muted);font-size:11px}
@@ -350,7 +423,7 @@ function render(q){
   document.getElementById('count').textContent=r.length+' из '+DATA.length;
   document.getElementById('results').innerHTML=r.slice(0,400).map(d=>
     '<div class="row"><div class="row-h"><span class="app">'+esc(d.app)+
-    '</span><span>'+esc(d.t)+'</span></div><div class="row-t">'+hl(d.text,q)+'</div>'+
+    '</span><span>'+esc(d.t)+'</span>'+(d.asr?'<span>'+esc(d.asr)+'</span>':'')+'</div><div class="row-t">'+hl(d.text,q)+'</div>'+
     (d.raw?'<div class="row-raw">сырой: '+hl(d.raw,q)+'</div>':'')+'</div>').join('')||
     '<p class="empty">ничего не найдено</p>';
 }
