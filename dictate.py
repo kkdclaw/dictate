@@ -88,7 +88,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.16.0"
+VERSION = "0.16.1"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -436,15 +436,19 @@ def _repo_status(repo: str, full_mb, max_age=3.0) -> dict:
         st = {"path": d, "state": "none", "mb": 0.0, "full": full_mb}
         _repo_cache[repo] = (time.time(), st)
         return st
-    # Закачка текущего этапа живая по определению: поток загрузчика стоит в
-    # snapshot_download, и mtime тут ни при чём — hf_xet трогает файл только
-    # когда идут байты, а на туннеле пауза в 5 минут обычна. Без этого блоб
-    # «старел», прогресс исчезал, и панель советовала «Перезапустить» —
-    # ровно то, от чего download_watch должен был уберечь. Возраст — только
-    # для чужих закачек (осиротевшие после прерванной)
+    # Закачка текущего этапа живая, пока этап идёт: поток загрузчика стоит в
+    # snapshot_download, а hf_xet трогает файл только когда идут байты — на
+    # туннеле пауза в 5 минут обычна. Раньше блоб «старел», прогресс исчезал,
+    # и панель советовала «Перезапустить» — ровно то, от чего download_watch
+    # должен был уберечь. Но живой блоб этого этапа хоть раз трогали ПОСЛЕ его
+    # начала; сирота от давно прерванной закачки (741 МБ от 17.08 рядом с
+    # готовым whisper) — нет, и он идёт по старому правилу возраста
+    now = time.time()
     active = STATE["loading"] and (STATE.get("stage_repo") or ("",))[0] == repo
+    since = STATE.get("stage_ts", now) - 5  # запас на разницу часов файловой системы
     incomplete = [p for p in glob.glob(os.path.join(d, "blobs", "*.incomplete"))
-                  if active or time.time() - os.path.getmtime(p) < 300]
+                  if (active and os.path.getmtime(p) >= since)
+                  or now - os.path.getmtime(p) < 300]
     snaps = glob.glob(os.path.join(d, "snapshots", "*", "*"))
     # «скачана» — только если на месте веса и конфиг: HF кладёт симлинки по мере
     # загрузки, и прерванная закачка иначе выглядит готовой (а падает при старте)
