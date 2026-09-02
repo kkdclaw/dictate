@@ -82,7 +82,9 @@ def compute(rs):
                  for d, (a, dur) in sorted(perf.items())]
     today = datetime.now().strftime("%Y-%m-%d")
     return {
-        "asr_ms_med": median(asr_ms), "asr_ms_today": median(perf[today][0]) if today in perf else 0,
+        # asr_ms в БД — REAL: без round плитка печатает «4576.0 мс»
+        "asr_ms_med": round(median(asr_ms)),
+        "asr_ms_today": round(median(perf[today][0])) if today in perf else 0,
         "perf_days": perf_days,
         "asr_series": list(reversed(asr_ms))[-60:],  # хронологически, последние 60
         "total": total, "words": words, "secs": secs, "corrected": corrected,

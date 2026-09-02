@@ -88,7 +88,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.15.9"
+VERSION = "0.16.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -120,9 +120,19 @@ def load_stage(i: int, what: str, repo: str = "", full_mb: float = 0.0):
     STATE["stage"] = (i, len(LOAD_STAGES), what)
     STATE["stage_ts"] = now
     STATE["stage_repo"] = (repo, full_mb) if repo else None
-    STATE["dl"] = None  # прогресс прошлого этапа к новому отношения не имеет
     print(f"  ⏳ {i}/{len(LOAD_STAGES)} {what}… (с начала {now - STATE['started']:.1f}с)",
           flush=True)
+
+
+def cur_dl():
+    """Прогресс скачивания модели текущего этапа (None — сейчас не качаем).
+
+    Считается из DL по STATE["stage_repo"] в момент запроса: раньше это было
+    зеркало STATE["dl"] с двумя писателями (load_stage сбрасывал, download_watch
+    раз в 2 с переписывал по репо, взятому в начале цикла), и при смене этапа
+    до 2 с под новой подписью показывался прогресс прошлого репо."""
+    tgt = STATE.get("stage_repo")
+    return DL.get(tgt[0]) if STATE["loading"] and tgt else None
 
 
 def _fmt_eta(sec: float) -> str:
@@ -150,7 +160,7 @@ def dl_text(d: dict) -> str:
         return size  # скорость ещё не мерили — не выдумываем ни её, ни остановку
     idle = d.get("idle", 0)
     if idle > 60:
-        return f"{size} · данные не идут уже {idle / 60:.0f} мин"
+        return f"{size} · данные не идут уже {_fmt_secs(idle)}"
     return f"{size} · считаю скорость…"
 
 
@@ -160,7 +170,7 @@ def loading_status_text() -> str:
     Скачивание и прогрев — разные ожидания: первое меряется гигабайтами и
     минутами сети, второе — секундами чтения с диска. Совет «перезапустить»
     уместен только во втором: перезапуск посреди закачки её лишь обрывает."""
-    st, d = STATE.get("stage"), STATE.get("dl")
+    st, d = STATE.get("stage"), cur_dl()
     if not d:
         return (f"⏳ Прогрев: {stage_text()}. Модели уже на диске, идёт загрузка "
                 "в память: обычно 5–30 с, большие — 1–3 минуты. Если номер этапа "
@@ -184,7 +194,7 @@ def stage_text() -> str:
     if not st:
         return "старт"
     i, n, what = st
-    d = STATE.get("dl")
+    d = cur_dl()
     if d:  # качаем — «уже 12 с» тут бесполезно, важны проценты и остаток
         return f"{i}/{n} {what} — скачиваю {dl_text(d)}"
     return f"{i}/{n} {what} — уже {time.time() - STATE['stage_ts']:.0f} с"
@@ -426,8 +436,15 @@ def _repo_status(repo: str, full_mb, max_age=3.0) -> dict:
         st = {"path": d, "state": "none", "mb": 0.0, "full": full_mb}
         _repo_cache[repo] = (time.time(), st)
         return st
+    # Закачка текущего этапа живая по определению: поток загрузчика стоит в
+    # snapshot_download, и mtime тут ни при чём — hf_xet трогает файл только
+    # когда идут байты, а на туннеле пауза в 5 минут обычна. Без этого блоб
+    # «старел», прогресс исчезал, и панель советовала «Перезапустить» —
+    # ровно то, от чего download_watch должен был уберечь. Возраст — только
+    # для чужих закачек (осиротевшие после прерванной)
+    active = STATE["loading"] and (STATE.get("stage_repo") or ("",))[0] == repo
     incomplete = [p for p in glob.glob(os.path.join(d, "blobs", "*.incomplete"))
-                  if time.time() - os.path.getmtime(p) < 300]
+                  if active or time.time() - os.path.getmtime(p) < 300]
     snaps = glob.glob(os.path.join(d, "snapshots", "*", "*"))
     # «скачана» — только если на месте веса и конфиг: HF кладёт симлинки по мере
     # загрузки, и прерванная закачка иначе выглядит готовой (а падает при старте)
@@ -520,7 +537,6 @@ def download_watch():
             if now - last_log.get(repo, 0) >= 30:  # в лог редко: он и так растёт
                 last_log[repo] = now
                 print(f"  ⬇️ {repo.split('/')[-1]}: {dl_text(DL[repo])}", flush=True)
-        STATE["dl"] = DL.get(tgt[0]) if (STATE["loading"] and tgt) else None
 
 
 def style_for(app: str) -> str:
@@ -794,6 +810,13 @@ def ensure_stream():
     if reopen_lock.busy():
         return  # кто-то уже переоткрывает — не вставать в очередь
     if stream_alive():
+        # поток жив, но нули — не чаще раза в минуту: USB-микрофон с DSP отдаёт
+        # в тишине точные нули, и без гейта каждое нажатие переоткрывало бы
+        # поток (щелчок, потерянная первая секунда). Если после переоткрытия
+        # звука всё равно нет, дальше разберётся ветка «запись пустая»
+        if time.time() - stream_holder.get("press_reopen", 0) < 60:
+            return
+        stream_holder["press_reopen"] = time.time()
         print(f"  микрофон отдаёт нули уже {_fmt_secs(silent)} (Bluetooth-линк уснул "
               f"за простой?) — переоткрываю...", flush=True)
     else:
@@ -938,7 +961,11 @@ def mic_watcher():
             time.sleep(0.2)
         try:
             print("Сменился вход по умолчанию — переключаюсь...", flush=True)
-            reopen_stream(follow_default=True)
+            # force при нулях: AirPods ушли на iPhone и вернулись под тем же
+            # именем — без force reopen_stream видел «прежний вход» и уходил ни
+            # с чем, а поток так и отдавал нули до следующего нажатия
+            reopen_stream(follow_default=True,
+                          force=mic_silent_for() >= SILENT_WATCH_SEC)
         except NoMicrophone:
             # не ошибка: наушники убрали в кейс, крышку закрыли. Вочдог подхватит
             STATE["mic"] = "нет — подключи микрофон"
@@ -2724,10 +2751,10 @@ class DictateApp(rumps.App):
                 item.title = title
         # пока запрос в полёте — кнопка не принимает клики (серая), а не молча
         # игнорирует их
-        want = None if (STATE.get("update") or {}).get("busy") else self.update_clicked
-        if getattr(self, "_upd_cb", "нет") is not want:
-            self._upd_cb = want
-            self.upd_item.set_callback(want)
+        busy = bool((STATE.get("update") or {}).get("busy"))
+        if getattr(self, "_upd_busy", None) != busy:  # bound-method каждый раз новый,
+            self._upd_busy = busy                    # сравнивать надо флаг
+            self.upd_item.set_callback(None if busy else self.update_clicked)
 
     def restart_clicked(self, _):
         if rumps.alert("Перезапуск Dictate",
@@ -2757,17 +2784,20 @@ class DictateApp(rumps.App):
             self._offer_install(u)
             return
 
+        from PyObjCTools import AppHelper
+
         def probe():
             STATE["update"] = {"busy": True}  # кнопка на это время гаснет
+            AppHelper.callAfter(self.refresh_about)  # сразу, а не по 5-с таймеру
             res = check_update()
             STATE["update"] = res
+            AppHelper.callAfter(self.refresh_about)
             if res.get("error"):
                 notify_ui("Обновления",
                           f"Не смог спросить GitHub: {res['error']}\n\n"
                           "Проверь сеть и нажми «Проверить обновления» ещё раз. "
                           "Установленная версия при этом работает как работала.")
             elif update_available(res):
-                from PyObjCTools import AppHelper
                 AppHelper.callAfter(self._offer_install, res)  # окна — с главного потока
             else:
                 notify_ui("Обновления", f"Установлено: {app_version()}\n"
@@ -2791,8 +2821,16 @@ class DictateApp(rumps.App):
                        "Незакоммиченные правки не тронем — при их наличии откажусь.",
                        ok="Установить и перезапустить", cancel="Позже") != 1:
             return
-        threading.Thread(target=lambda: notify_ui("Обновление Dictate", apply_update()),
-                         daemon=True).start()
+        def run():
+            # на время установки (до 600 с с uv sync) кнопка гаснет: второй клик
+            # запускал второй apply_update параллельно — гонка на .git/index.lock
+            # и откат одного прогона поверх pull другого
+            STATE["update"] = {**u, "busy": True, "installing": True}
+            msg = apply_update()
+            if (STATE.get("update") or {}).get("installing"):
+                STATE["update"] = u  # не поехало — кнопка снова предлагает установку
+            notify_ui("Обновление Dictate", msg)
+        threading.Thread(target=run, daemon=True).start()
 
     def update_help(self, _):
         rumps.alert("Как обновляется Dictate",
@@ -3203,11 +3241,8 @@ class DictateApp(rumps.App):
             if st["state"] == "done":
                 txt, btn, act = f"● скачана · {_fmt_mb(st['mb'])} · {label}", "Папка", f"dir:{role}"
             elif st["state"] == "loading":
-                d = DL.get(repo)
-                txt, btn, act = (f"⬇️ скачивается: "
-                                 + (dl_text(d) if d else
-                                    f"{_fmt_mb(st['mb'])} из ~{_fmt_mb(full)}")
-                                 + f" · {label}", None, None)
+                txt, btn, act = (f"⬇️ скачивается: {dl_text(DL.get(repo) or st)} · {label}",
+                                 None, None)
             elif st["state"] == "partial":
                 txt, btn, act = (f"⚠️ скачана частично ({_fmt_mb(st['mb'])} из ~{_fmt_mb(full)}) · "
                                  f"{label} — закачка обрывалась", "Докачать", f"dl:{role}")
@@ -3226,11 +3261,13 @@ class DictateApp(rumps.App):
             mrows.append((title, f"{repo.split('/')[-1]}\n{txt}", btn, act))
         layer = terms_layer_for(STATE["app"])
         hint = load_terms(layer)
+        nterms = len([t for t in hint.split(",") if t.strip()])  # '' → 0, не 1
+        first = hint[:90] + ("…" if len(hint) > 90 else "") if hint else "—"
         mrows.append(("Словарь",
                       (f"слой «{layer}» + общий" if layer else "общий (слой не выбран)")
-                      + f" · в подсказку ушло {len(hint.split(', '))} терминов, "
+                      + f" · в подсказку ушло {nterms} терминов, "
                       + f"{tok_len(hint)} из {HINT_TOKENS} токенов\n"
-                      + f"первые: {hint[:90]}…", "Открыть…", "terms"))
+                      + f"первые: {first}", "Открыть…", "terms"))
         ec = _repo_status(*ECAPA)
         ec_txt = ("● " + _fmt_mb(ec["mb"]) if ec["state"] == "done"
                   else "⬇️ " + dl_text(DL.get(ECAPA[0]) or ec) if ec["state"] == "loading"
@@ -3404,7 +3441,7 @@ class DictateApp(rumps.App):
             # ⏳ с номером этапа читается как «сейчас поедет» — верно, когда модели
             # на диске и идёт загрузка в память. Пока они качаются, это неправда:
             # там сеть на десятки минут, и показывать надо проценты скачивания
-            d = STATE.get("dl")
+            d = cur_dl()
             st = STATE.get("stage")
             if d and d["full"]:
                 title = f"⬇️{min(99, d['mb'] / d['full'] * 100):.0f}%"
@@ -4121,7 +4158,16 @@ def apply_update() -> str:
     перемоткой — если локально есть свои коммиты или правки, честно отказываем.
     Перед перезапуском компилируем код; не собрался — откатываем на прежний коммит.
     """
-    if _git("status", "--porcelain"):
+    # не через _git: тот при ошибке/таймауте отдаёт пустую строку, и занятый
+    # или сломанный репозиторий выглядел бы как чистое дерево
+    try:
+        st = subprocess.run(["git", "-C", BASE, "status", "--porcelain"],
+                            capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        return f"git status не ответил ({e}) — обновление отменено."
+    if st.returncode != 0:
+        return f"git status не прошёл:\n{(st.stderr or st.stdout).strip()[:400]}"
+    if st.stdout.strip():
         return ("В рабочей копии есть незакоммиченные правки — обновление отменено.\n"
                 "Сохрани или откати их (git stash), потом повтори.")
     before = _git("rev-parse", "HEAD")
@@ -4173,6 +4219,8 @@ def update_summary() -> str:
     u = STATE.get("update")
     if not u:
         return "с запуска не проверялись"
+    if u.get("installing"):
+        return "устанавливаю обновление…"
     if u.get("busy"):
         return "спрашиваю GitHub…"
     when = time.strftime("%H:%M", time.localtime(u.get("checked", 0)))
@@ -4192,6 +4240,8 @@ def update_action_label(short: bool = False) -> str:
     обрезается многоточием («Установить 0.14.0 и переза…»), а обрезанная кнопка
     как раз и есть та самая непонятность «куда я жму»."""
     u = STATE.get("update") or {}
+    if u.get("installing"):
+        return "Устанавливаю…"
     if u.get("busy"):
         return "Спрашиваю GitHub…"
     if u.get("tag"):
