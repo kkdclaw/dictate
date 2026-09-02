@@ -88,7 +88,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.15.8"
+VERSION = "0.15.9"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -314,6 +314,12 @@ def load_config():
         pass
     except (ValueError, OSError, UnicodeDecodeError) as e:
         print(f"  config.json не прочитан ({e}) — работаю на дефолтах", flush=True)
+    v = CONFIG.get("llm_idle_min")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 1:
+        # 0/отрицательное = выгрузка каждые 30 с после любой правки, постоянный
+        # трэш загрузка/выгрузка; bool проходит проверку типа как int
+        print("  config: «llm_idle_min» должен быть ≥ 1 — беру дефолт", flush=True)
+        CONFIG["llm_idle_min"] = defaults["llm_idle_min"]
     if not isinstance(CONFIG.get("profiles"), dict):
         CONFIG["profiles"] = {}
     CONFIG["profiles"] = {a: st for a, st in CONFIG["profiles"].items()
@@ -1552,41 +1558,84 @@ def ml_worker(ready: threading.Event):
         # KV-кэш префикса промпта держит ссылки на веса и лежит здесь же —
         # иначе выгрузка была бы бутафорской.
         L = {"llm": None, "tok": None, "cache": None, "tokens": [],
-             "used": time.time(), "preload": False}
+             "used": time.time(), "preload": False,
+             "worked": False,  # после загрузки хоть раз чистила? (см. llm_idle)
+             "fails": 0}       # провалы загрузки по требованию подряд (llm_failed)
         last_stats = {}  # заполняется llm_run: gen_tps, prompt_tps, gen_tokens
 
         def llm_load(warm_stage: bool = False) -> float:
             """Загрузить и прогреть модель чистки. Только из ML-потока."""
             t0 = time.time()
-            L["llm"], L["tok"] = load_llm(LLM_MODEL)
-            L["cache"], L["tokens"] = make_prompt_cache(L["llm"]), []
+            # used — ДО того, как модель появится в L: иначе сторож простоя
+            # видит загруженную модель со старым used и ставит выгрузку прямо
+            # во время многосекундной загрузки
+            L["used"], L["worked"] = t0, False
+            llm, tok = load_llm(LLM_MODEL)
+            L["llm"], L["tok"] = llm, tok
+            L["cache"], L["tokens"] = make_prompt_cache(llm), []
             if warm_stage:
                 load_stage(5, "прогрев")
-            for _ in stream_generate(L["llm"], L["tok"], prompt=L["tok"].apply_chat_template(
-                    [{"role": "user", "content": "ок"}], add_generation_prompt=True),
-                    max_tokens=4):
-                pass  # прогрев, чтобы первая чистка была быстрой
+            try:
+                for _ in stream_generate(llm, tok, prompt=tok.apply_chat_template(
+                        [{"role": "user", "content": "ок"}], add_generation_prompt=True),
+                        max_tokens=4):
+                    pass  # прогрев, чтобы первая чистка была быстрой
+            except Exception:
+                # Metal OOM на 16 ГБ: веса уже в L, и без этого они висели бы в
+                # памяти под флагом «не в памяти», а сторож выгружал бы их на
+                # следующем тике
+                llm_free("прогрев не удался")
+                raise
             L["used"] = time.time()
             STATE["llm_loaded"] = True
             return time.time() - t0
 
+        def llm_idle() -> bool:
+            """Пора ли выгружать по простою. Считает и сторож (чтобы разбудить
+            ML-поток), и сам ML-поток перед выгрузкой: снимок из чужого потока
+            устаревает — диктовка уже снята с очереди, used ещё старый."""
+            if not CONFIG["unload_llm"] or L["llm"] is None or not jobs.empty():
+                return False
+            limit = CONFIG["llm_idle_min"] * 60
+            if not L["worked"]:
+                # прогрели ради следующей диктовки, а она не пришла: выгрузить
+                # сейчас — значит платить за загрузку впустую (кто диктует раз
+                # в 15 мин при пороге 10, не получал чистку никогда). Даём три
+                # порога, потом всё же освобождаем память
+                limit *= 3
+            return time.time() - L["used"] > limit
+
         def llm_free(why: str = "простой"):
-            """Отпустить модель и кэш; вернуть системе буферы Metal."""
+            """Отпустить модель и кэш; вернуть системе буферы Metal.
+
+            Задание могло пролежать в очереди: галку успели выключить, модель
+            только что поработала — поэтому причина перепроверяется здесь."""
             if L["llm"] is None:
+                return
+            if why == "простой" and not llm_idle():
+                return
+            if why == "галка" and not CONFIG["unload_llm"]:
                 return
             L.update(llm=None, tok=None, cache=None, tokens=[])
             gc.collect()
             mx.clear_cache()  # без этого память останется в пуле MLX
             STATE["llm_loaded"] = False
-            print(f"Модель чистки выгружена из памяти ({why}) — загружу обратно, "
-                  f"когда понадобится правка", flush=True)
+            print("Модель чистки выгружена из памяти ("
+                  + ("включена выгрузка в простое" if why == "галка" else why)
+                  + ") — загружу обратно, когда понадобится правка", flush=True)
 
         def llm_ready():
             """Модель под рукой: если её выгрузили — грузим сейчас."""
             if L["llm"] is None:
                 print(f"  ⏳ гружу модель чистки {LLM_MODEL.split('/')[-1]}"
                       + (f" (~{_fmt_mb(llm_mb)})" if llm_mb else "") + "…", flush=True)
-                dt = llm_load()
+                try:
+                    dt = llm_load()
+                except Exception as e:
+                    llm_failed(e)
+                    raise
+                L["fails"] = 0
+                last_stats["load_s"] = dt  # в замер llm_ms загрузка не входит
                 print(f"  ✓ модель чистки готова за {dt:.1f}с", flush=True)
                 if dt > 30:
                     print("  ⚠ так долго — веса шли через своп: памяти не хватает, "
@@ -1608,13 +1657,45 @@ def ml_worker(ready: threading.Event):
             чужого потока, поэтому кладёт задачу в очередь ML-потока."""
             while True:
                 time.sleep(30)
-                if (CONFIG["unload_llm"] and L["llm"] is not None and jobs.empty()
-                        and time.time() - L["used"] > CONFIG["llm_idle_min"] * 60):
+                if llm_idle():
                     jobs.put(("llm_unload", "простой"))
 
+        def llm_failed(e: Exception):
+            """Модель чистки не поехала по требованию (галка «Выгружать…»).
+
+            На старте её грузит try выше и при провале откатывает на модель по
+            умолчанию с перезапуском; с галкой старт модель не трогает, и провал
+            раньше тонул в логе каждой диктовки, а загрузка (с возможным
+            скачиванием) повторялась на каждой правке. Второй провал подряд —
+            откат конфига и уведомление; без перезапуска: диктовка сырым текстом
+            работает, а дефолтная модель подъедет при следующей правке."""
+            global LLM_MODEL
+            L["fails"] += 1
+            fallback = ROLES["llm"][1][0][0]
+            if L["fails"] < 2 or CONFIG["llm_model"] == fallback:
+                return
+            print(f"✗ Модель {LLM_MODEL.split('/')[-1]} не загрузилась дважды: {e}\n"
+                  f"  Возвращаю {fallback.split('/')[-1]}.", flush=True)
+            CONFIG["llm_model"] = LLM_MODEL = fallback
+            save_config()
+            L["fails"] = 0
+            notify_ui("Модель чистки не загрузилась",
+                      f"{e}\n\nВернул модель по умолчанию ({fallback.split('/')[-1]}); "
+                      "она загрузится при следующей правке.")
+
         if CONFIG["unload_llm"]:
-            load_stage(4, f"чистка: {LLM_MODEL.split('/')[-1]} — по требованию, "
-                          "в память сейчас не берём", LLM_MODEL, llm_mb)
+            if _repo_status(LLM_MODEL, llm_mb)["state"] != "done":
+                # окно «Модели» обещает «скачается при первом запуске» — держим
+                # слово на этапе 4 с прогрессом, а не молча посреди первой
+                # диктовки; в память при этом не берём
+                load_stage(4, f"чистка: {LLM_MODEL.split('/')[-1]} — скачиваю, "
+                              "в память не беру", LLM_MODEL, llm_mb)
+                from huggingface_hub import snapshot_download
+                snapshot_download(LLM_MODEL)
+                _repo_cache.pop(LLM_MODEL, None)
+            else:
+                load_stage(4, f"чистка: {LLM_MODEL.split('/')[-1]} — по требованию, "
+                              "в память сейчас не берём", LLM_MODEL, llm_mb)
             load_stage(5, "прогрев: без модели чистки не нужен")
         else:
             load_stage(4, f"чистка: {LLM_MODEL.split('/')[-1]}"
@@ -1724,6 +1805,7 @@ def ml_worker(ready: threading.Event):
 
     def llm_run(system: str, user: str, max_factor: int = 2) -> str:
         llm, tok = llm_ready()  # модель могла быть выгружена в простое
+        L["worked"] = True      # прогрев — не работа: см. llm_idle
         pcache = L              # KV-кэш префикса лежит рядом с моделью
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         prompt = tok.apply_chat_template(msgs, add_generation_prompt=True)
@@ -1861,6 +1943,7 @@ def ml_worker(ready: threading.Event):
         lay = f" словарь:{rec['layer']}" if rec.get("layer") else ""
         lang = rec.get("lang", "ru")
         lay += f" язык:{lang or 'auto'}" if lang != "ru" else ""
+        lay += f" +загрузка {rec['llm_load_s']:.0f}s" if rec.get("llm_load_s") else ""
         print(f"  [{rec['duration']:.1f}s аудио → asr {t_asr:.1f}s (×{rtf:.0f}) + "
               f"llm {rec['llm_ms'] / 1000:.1f}s{speed}{vp}{lay} → {rec['app']}/"
               f"{rec['style']}{pick}] {text}{mark}{doubt}", flush=True)
@@ -2126,13 +2209,16 @@ def ml_worker(ready: threading.Event):
             except Exception as e:
                 print(f"  ошибка обработки (вставляю сырой): {e}", flush=True)
                 text = raw
-            t_llm = time.time() - t1
+            # холодная загрузка модели (галка «Выгружать…») — не скорость чистки:
+            # в «Статистику» идёт только сама правка, загрузка — отдельно в лог
+            t_llm = max(0.0, time.time() - t1 - last_stats.get("load_s", 0.0))
             text = polish(style, text)
             if snippet_tail:  # «пиши на, моя почта» — одной вставкой
                 text = text + ("\n" if "\n" in snippet_tail else " ") + snippet_tail
             rec = {"ts": time.time(), "text": text, "raw": raw, "duration": duration,
                    "app": app, "style": style, "layer": layer, "asr_ms": round(t_asr * 1000),
                    "llm_ms": round(t_llm * 1000), "gen_tps": last_stats.get("gen_tps"),
+                   "llm_load_s": last_stats.get("load_s"),
                    "gen_tokens": last_stats.get("gen_tokens"), "vp_sim": vp_sim,
                    "doubtful": list(doubtful), "lang": CONFIG["asr_language"]}
             if CONFIG["review"] and not cmd:
@@ -3131,8 +3217,10 @@ class DictateApp(rumps.App):
             if role == "llm":
                 # где модель прямо сейчас: главный вопрос при включённой выгрузке
                 txt += ("\n● в памяти" if STATE["llm_loaded"] else "\n○ не в памяти")
-                txt += (f" · выгружаю после {CONFIG['llm_idle_min']} мин простоя, "
-                        "гружу обратно при первой правке" if CONFIG["unload_llm"]
+                txt += (f" · выгружаю после {CONFIG['llm_idle_min']} мин простоя "
+                        f"(прогретую, но ещё не поработавшую — после "
+                        f"{CONFIG['llm_idle_min'] * 3}), гружу обратно фоном после "
+                        "первой диктовки с правкой" if CONFIG["unload_llm"]
                         else " · держим постоянно (галка «Выгружать модель чистки "
                              "в простое» выключена)")
             mrows.append((title, f"{repo.split('/')[-1]}\n{txt}", btn, act))
@@ -3550,7 +3638,7 @@ class DictateApp(rumps.App):
         sender.state = int(CONFIG["unload_llm"])
         save_config()
         if CONFIG["unload_llm"]:
-            jobs.put(("llm_unload", "включена выгрузка в простое"))
+            jobs.put(("llm_unload", "галка"))
 
     def open_terms(self, _):
         subprocess.run(["open", "-t", os.path.join(BASE, "terms.txt")])
