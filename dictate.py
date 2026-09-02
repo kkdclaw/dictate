@@ -87,7 +87,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.15.6"
+VERSION = "0.15.7"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -1590,7 +1590,7 @@ def ml_worker(ready: threading.Event):
         # KV-кэш префикса промпта держит ссылки на веса и лежит здесь же —
         # иначе выгрузка была бы бутафорской.
         L = {"llm": None, "tok": None, "cache": None, "tokens": [],
-             "used": time.time()}
+             "used": time.time(), "preload": False}
         last_stats = {}  # заполняется llm_run: gen_tps, prompt_tps, gen_tokens
 
         def llm_load(warm_stage: bool = False) -> float:
@@ -1624,9 +1624,22 @@ def ml_worker(ready: threading.Event):
             if L["llm"] is None:
                 print(f"  ⏳ гружу модель чистки {LLM_MODEL.split('/')[-1]}"
                       + (f" (~{_fmt_mb(llm_mb)})" if llm_mb else "") + "…", flush=True)
-                print(f"  ✓ модель чистки готова за {llm_load():.1f}с", flush=True)
+                dt = llm_load()
+                print(f"  ✓ модель чистки готова за {dt:.1f}с", flush=True)
+                if dt > 30:
+                    print("  ⚠ так долго — веса шли через своп: памяти не хватает, "
+                          "закрой тяжёлые приложения (браузер) — см. «Статистика» → "
+                          "«Производительность»", flush=True)
             L["used"] = time.time()
             return L["llm"], L["tok"]
+
+        def llm_preload_bg():
+            """Прогрев модели чистки отдельной задачей в очереди, а не здесь и
+            сейчас: вставка сырого текста уже ушла, а диктовки, пришедшие до
+            прогрева, задача пропустит вперёд (см. llm_preload в цикле)."""
+            if L["llm"] is None and not L["preload"]:
+                L["preload"] = True
+                jobs.put(("llm_preload", None))
 
         def llm_idle_watch():
             """Сторож простоя. Сам ничего не трогает: MLX не переживает вызовы из
@@ -1818,6 +1831,16 @@ def ml_worker(ready: threading.Event):
         if style == "raw":
             return raw
         if STATE["enhance"] and (needs_enhance(raw) or doubtful):  # clean / casual
+            if L["llm"] is None:
+                # Модель выгружена в простое. Грузить её прямо тут — значит держать
+                # вставку и всю очередь диктовок за ней; на 16 ГБ со свопом это
+                # минуты «залипания» (Air, 02.09.2026). Автоправка не стоит такого
+                # ожидания: сырой текст уходит сразу, модель греется фоном. Явные
+                # стили (перевод, «Строгий» и т.п.) выше по функции ждут как ждали.
+                print("  модель чистки не в памяти — вставляю без чистки, грею её "
+                      "фоном к следующей диктовке", flush=True)
+                llm_preload_bg()
+                return raw
             out = enhance(raw, doubtful=doubtful, app=app)
             terms_lower = {t.strip().lower() for t in load_terms(terms_layer_for(app)).split(",")}
             guarded = guard_correction(raw, out, terms_lower)
@@ -1918,6 +1941,19 @@ def ml_worker(ready: threading.Event):
         kind, payload = jobs.get()
         if kind == "llm_unload":  # галка «Выгружать…» или сторож простоя
             llm_free(payload or "простой")
+            continue
+        if kind == "llm_preload":  # фоновый прогрев модели чистки (llm_preload_bg)
+            if not jobs.empty():  # диктовки важнее прогрева — пропускаем их вперёд
+                jobs.put(("llm_preload", None))
+                continue
+            L["preload"] = False
+            if L["llm"] is None:
+                try:
+                    llm_ready()
+                except Exception as e:  # прогрев не должен ронять ML-поток:
+                    # не вышло — попробуем снова при реальной правке
+                    print(f"  ✗ фоновый прогрев модели чистки не удался: {e}",
+                          flush=True)
             continue
         if kind == "logrec":  # выбрали вариант в окне постобработки
             store(payload)
