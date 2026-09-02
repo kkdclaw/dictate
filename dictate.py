@@ -40,6 +40,7 @@ import hotkey
 import hotkeywindow
 import commands
 import reviewwindow
+from textclean import strip_loops
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -87,7 +88,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.15.7"
+VERSION = "0.15.8"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -1100,16 +1101,28 @@ def paste_text(text: str) -> None:
     # сервер не отвечает — так было при дедлоке WindowServer 24.08.2026),
     # раньше ВСЕ следующие вставки ждали его вечно: запись идёт, текст не
     # появляется, помогал только рестарт. Теперь ждём 3 с и вставляем без замка
-    own = _paste_lock.acquire(timeout=3.0)
-    if not own:
-        print("  ⚠ прошлая вставка не отпустила буфер за 3 с — вставляю, не дожидаясь",
-              flush=True)
+    global _paste_lock
+    keep = bool(CONFIG.get("restore_clipboard", True))
+    lock = _paste_lock
+    if not lock.acquire(timeout=3.0):
+        # Возврат прошлой вставки завис. Снимок буфера сейчас — это текст
+        # ТОЙ диктовки, и «вернуть» его значило бы затереть скопированное
+        # пользователем, а зависший поток свой возврат пропустит (changeCount
+        # уйдёт). Поэтому эту вставку делаем без снимка и возврата, а замок
+        # заводим новый: старый остаётся у зависшего потока, следующие
+        # вставки не платят по 3 с до перезапуска
+        print("  ⚠ прошлая вставка не отпустила буфер за 3 с — вставляю без "
+              "возврата буфера, замок пересоздан", flush=True)
+        keep = False
+        lock = _paste_lock = threading.Lock()
+        lock.acquire()
 
     def _release():
-        if own:
-            _paste_lock.release()
+        try:
+            lock.release()
+        except RuntimeError:
+            pass  # уже отпущен
 
-    keep = bool(CONFIG.get("restore_clipboard", True))
     try:
         pb = NSPasteboard.generalPasteboard()
         saved = _pb_snapshot(pb) if keep else None
@@ -1414,57 +1427,6 @@ def strip_short_period(text: str) -> str:
     if text.endswith(".") and "." not in text[:-1] and len(text) < 60:
         return text[:-1]
     return text
-
-
-# Whisper учился на субтитрах и на хвосте тишины дописывает титры из обучающих
-# данных. Ищем их ТОЛЬКО в самом конце: в середине такая фраза почти наверняка
-# настоящая («продолжение следует на следующей неделе»)
-TAIL_JUNK = ("продолжение следует", "субтитры сделал", "субтитры делал",
-             "субтитры создавал", "субтитры и перевод", "редактор субтитров",
-             "спасибо за просмотр", "подписывайтесь на канал", "ставьте лайки",
-             "thanks for watching", "thank you for watching",
-             "subtitles by", "amara.org")
-# Зацикливание: кусок повторяется подряд четыре раза и больше. Кусок берём
-# любой (`.`, а не `\w`), поэтому ловятся и СКЛЕЕННЫЕ повторы «ratosratos…»,
-# мимо которых счёт по словам проходил насквозь
-LOOP_RE = re.compile(r"(.{2,30}?)\1{3,}", re.S)
-LOOP_MIN = 12  # символов в петле: короче — это «ха-ха-ха-ха», а не галлюцинация
-
-
-def strip_loops(text: str) -> tuple[str, list[str]]:
-    """Вырезать из распознанного галлюцинации Whisper: петли и титры.
-
-    Петля («ratos» 220 раз, «secular secular…») и хвост «Продолжение
-    следует…» — не оговорка диктующего, а бред модели на тишине. Сторож ниже
-    считал повторы по СЛОВАМ: склеенную петлю он не видел вовсе, а когда
-    срабатывал — выбрасывал диктовку ЦЕЛИКОМ, вместе с нормальным началом
-    (49 секунд речи в мусор). Поэтому режем точечно, остальное едет дальше.
-
-    Возвращает (очищенный текст, что вырезали) — вырезанное идёт в лог."""
-    cut, out, pos = [], [], 0
-    for m in LOOP_RE.finditer(text):
-        if len(m.group(0)) < LOOP_MIN:
-            continue
-        out.append(text[pos:m.start()])
-        cut.append(f"«{m.group(1).strip()}»×{len(m.group(0)) // len(m.group(1))}")
-        pos = m.end()
-    out.append(text[pos:])
-    text = re.sub(r"\s{2,}", " ", "".join(out)).strip()
-    for _ in range(len(TAIL_JUNK)):  # титров может быть несколько подряд
-        low = text.lower()
-        for phrase in TAIL_JUNK:
-            i = low.rfind(phrase)
-            # титры сидят в САМОМ хвосте: после них — подпись автора и точки,
-            # не больше. Иначе срежем настоящую речь («продолжение следует на
-            # следующей неделе, я допишу отчёт»). i > 0 — на всю диктовку
-            # правило не распространяется: одну фразу целиком не выбрасываем
-            if i > 0 and len(text) - (i + len(phrase)) <= 20:
-                cut.append(text[i:].strip())
-                text = text[:i].rstrip(" \t,-–—")  # точку предложения оставляем
-                break
-        else:
-            break
-    return text.strip(), cut
 
 
 TRANSLATE_PROMPT = (
@@ -2007,7 +1969,7 @@ def ml_worker(ready: threading.Event):
                 print(f"  ✗ проверка голоса не вышла: {e}", flush=True)
                 enrollwindow.finish(False, f"Не получилось: {e}", "Проверить ещё раз")
             continue
-        audio, rec_app, token = payload
+        audio, rec_app, token, rec_end = payload
         ok = False
         try:
             duration = len(audio) / SAMPLE_RATE
@@ -2020,6 +1982,16 @@ def ml_worker(ready: threading.Event):
                       f"запись{since} (Bluetooth-линк уснул за простой? AirPods в кейсе "
                       f"или на другом устройстве?) — переоткрываю поток, скажи ещё раз "
                       f"через пару секунд", flush=True)
+                # Задание могло долго ждать в очереди за Whisper/LLM, и за это
+                # время поток уже переоткрыл ensure_stream по следующему
+                # нажатию, а то и идёт запись. Рвать живой поток из ML-потока
+                # нельзя: дыра в chunks, потерянные слова, щелчок A2DP↔HFP.
+                # last_signal новее конца записи = звук пошёл или поток открыт
+                # заново (open_stream ставит его при открытии)
+                last = stream_holder.get("last_signal") or 0.0
+                if recording or reopen_lock.busy() or last > rec_end:
+                    print("  поток уже ожил или переоткрыт — не трогаю", flush=True)
+                    continue
                 try:
                     reopen_stream(force=True)  # force: по пульсу поток «жив», без него холостой
                 except Exception as e:
@@ -2086,7 +2058,7 @@ def ml_worker(ready: threading.Event):
             except Exception as e:
                 print(f"  ошибка распознавания: {e}", flush=True)
                 continue
-            raw, cut = strip_loops(raw)  # петли и субтитровые титры — до всего
+            raw, cut = strip_loops(raw, result.get("segments"))  # петли и титры — до всего
             if cut:
                 print(f"  ✂ вырезал галлюцинацию: {', '.join(cut)[:160]}", flush=True)
             # слова, в которых Whisper сам не уверен, — кандидаты на ослышку.
@@ -2242,7 +2214,7 @@ def stop_and_submit():
         hud.show("busy", token)  # капсула: «распознаю…» до вставки/отказа
         # приложение-получатель фиксируем СЕЙЧАС: пока идёт распознавание,
         # фронтальным может стать другое окно, и профиль/вставка уедут не туда
-        jobs.put(("dictate", (audio, frontmost_app(), token)))
+        jobs.put(("dictate", (audio, frontmost_app(), token, time.time())))
     else:
         hud.hide(token)
 
