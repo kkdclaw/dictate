@@ -88,7 +88,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.16.1"
+VERSION = "0.17.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -244,6 +244,12 @@ STYLES = {  # ключ -> подпись в меню
     "raw": "Как сказано (без LLM)",
     "translate": "Перевод → EN",
 }
+# как часто автообновление спрашивает GitHub: ключ конфига -> (подпись в меню, секунды)
+UPDATE_PERIODS = {"day": ("Раз в день", 86400),
+                  "week": ("Раз в неделю", 7 * 86400),
+                  "month": ("Раз в месяц", 30 * 86400)}
+APP = None  # экземпляр DictateApp — чтобы фоновые потоки могли обновить меню
+
 CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "translate_all": False, "vp_threshold": 0.40, "enhance": True,
           "asr_language": "ru",          # "ru" | "en" | "" — автоопределение (медленнее на ~1 с)
@@ -251,7 +257,9 @@ CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "hotkey": hotkey.DEFAULT,      # см. hotkey.py: «alt_r», «fn», «ctrl+space», «cmd+shift+d»…
           "restore_clipboard": True,     # после вставки вернуть в буфер то, что там лежало
           "commands": True,              # голосовые команды и сниппеты (commands.py)
-          "auto_check_updates": False,   # один git ls-remote через минуту после старта; ставить — только вручную
+          "auto_update": True,           # молча проверять GitHub раз в auto_update_every и ставить новое
+          "auto_update_every": "day",    # "day" | "week" | "month" — см. UPDATE_PERIODS
+          "auto_update_last": 0.0,       # unix-время последней удачной проверки (переживает перезапуск)
           "default_terms": "",           # слой словаря по умолчанию ("" — только общий terms.txt)
           "terms_profiles": {},          # приложение -> слой словаря (как profiles для стилей)
           "unload_llm": False,           # выгружать модель чистки из памяти, пока она не нужна
@@ -330,6 +338,10 @@ def load_config():
         # трэш загрузка/выгрузка; bool проходит проверку типа как int
         print("  config: «llm_idle_min» должен быть ≥ 1 — беру дефолт", flush=True)
         CONFIG["llm_idle_min"] = defaults["llm_idle_min"]
+    if CONFIG.get("auto_update_every") not in UPDATE_PERIODS:
+        CONFIG["auto_update_every"] = defaults["auto_update_every"]
+    # до 0.17 была галка «Проверять при запуске» — ничего не ставила, ключ больше не нужен
+    CONFIG.pop("auto_check_updates", None)
     if not isinstance(CONFIG.get("profiles"), dict):
         CONFIG["profiles"] = {}
     CONFIG["profiles"] = {a: st for a, st in CONFIG["profiles"].items()
@@ -2531,7 +2543,9 @@ def begin_hotkey_capture(on_done):
 
 class DictateApp(rumps.App):
     def __init__(self):
+        global APP
         super().__init__("Dictate", title="⏳", quit_button=rumps.MenuItem("Выход"))
+        APP = self
         self.mic_item = rumps.MenuItem("Микрофон: …")
         self.recent = rumps.MenuItem("Последние (клик — скопировать)")
         self.recent.add(rumps.MenuItem("пусто"))
@@ -2701,49 +2715,50 @@ class DictateApp(rumps.App):
     def _build_about_menu(self):
         """Три группы: что установлено · обновления · обслуживание.
 
-        Внутри каждой один и тот же порядок — сначала строка СОСТОЯНИЯ (серая,
-        не кликается), потом ДЕЙСТВИЯ над ним. Так уже было сделано с
-        обновлениями: раньше строка «Обновления» была и тем и другим сразу —
-        первый клик спрашивал GitHub, второй ставил, а между ними всплывало
-        окно «нажми эту строку ещё раз».
-
-        Версия жила по старому образцу: показывала состояние и молча копировала
-        справку по клику — узнать об этом было неоткуда. Теперь копирование —
-        отдельная строка, на которой написано, что она делает. Справка про
-        обновления переехала к обновлениям: после «Перезапустить службу» она
-        читалась как «как работает программа вообще»."""
+        Обновления — одна кнопка «Обновить» (сама спросит GitHub и, если есть
+        новое, поставит и перезапустит службу), галка «Автообновление» и
+        подменю «Проверять новую версию» (раз в день / неделю / месяц).
+        Строки состояния и справка убраны: с автообновлением «что известно»
+        живёт в логе и в окне состояния, а меню — только действия."""
         m = rumps.MenuItem(f"О программе · {VERSION}")
-        # без callback — некликабельные строки состояния
+        # без callback — некликабельная строка состояния
         self.ver_item = rumps.MenuItem(f"Dictate {app_version()}")
-        self.upd_status = rumps.MenuItem("Обновления: …")
         self.report_item = rumps.MenuItem("Скопировать данные для отчёта об ошибке",
                                           callback=self.copy_version)
         self.upd_item = rumps.MenuItem(update_action_label(), callback=self.update_clicked)
-        self.autoupd_item = rumps.MenuItem("Проверять при запуске",
-                                           callback=self.toggle_auto_check)
-        self.autoupd_item.state = int(bool(CONFIG.get("auto_check_updates")))
+        self.autoupd_item = rumps.MenuItem("Автообновление", callback=self.toggle_auto_update)
+        self.period_menu = rumps.MenuItem("Проверять новую версию")
+        self.period_items = {}
+        for key, (label, _secs) in UPDATE_PERIODS.items():
+            it = rumps.MenuItem(label, callback=self.set_update_period)
+            it._period = key
+            self.period_menu.add(it)
+            self.period_items[key] = it
+        self._sync_update_menu()
         self.restart_item = rumps.MenuItem("Перезапустить службу", callback=self.restart_clicked)
         m.add(self.ver_item)
         m.add(self.report_item)
         m.add(None)
-        m.add(self.upd_status)
         m.add(self.upd_item)
         m.add(self.autoupd_item)
-        m.add(rumps.MenuItem("Как обновляется Dictate…", callback=self.update_help))
+        m.add(self.period_menu)
         m.add(None)
         m.add(self.restart_item)
         return m
+
+    def _sync_update_menu(self):
+        self.autoupd_item.state = int(bool(CONFIG.get("auto_update")))
+        for key, it in self.period_items.items():
+            it.state = int(key == CONFIG.get("auto_update_every"))
 
     def refresh_about(self, _=None):
         # сама версия неизменна, но пометка «на диске новее» появляется после pull
         stale = code_updated_on_disk()
         # одна и та же стрелка на всём пути: ⬆️ в меню-баре → ⬆️ у «О программе»
-        # → ⬆️ на кнопке. Раньше метки в разных местах жили сами по себе, и было
-        # непонятно, куда эта стрелка ведёт
+        # → ⬆️ на кнопке
         mark = " ⬆️" if (update_available() or stale) else ""
         for item, title in (
                 (self.about_item, f"О программе · {VERSION}{mark}"),
-                (self.upd_status, f"Обновления: {update_summary()}"),
                 (self.upd_item, update_action_label()),
                 # вернуть подпись после «Скопировано ✓» — иначе она там и останется
                 (self.report_item, "Скопировать данные для отчёта об ошибке"),
@@ -2753,8 +2768,8 @@ class DictateApp(rumps.App):
                  if stale else "Перезапустить службу")):
             if item.title != title:
                 item.title = title
-        # пока запрос в полёте — кнопка не принимает клики (серая), а не молча
-        # игнорирует их
+        # пока проверка или установка в полёте — кнопка не принимает клики
+        # (серая), а не молча игнорирует их
         busy = bool((STATE.get("update") or {}).get("busy"))
         if getattr(self, "_upd_busy", None) != busy:  # bound-method каждый раз новый,
             self._upd_busy = busy                    # сравнивать надо флаг
@@ -2767,92 +2782,24 @@ class DictateApp(rumps.App):
                        ok="Перезапустить", cancel="Отмена") == 1:
             restart_app()
 
-    def toggle_auto_check(self, _):
-        CONFIG["auto_check_updates"] = not CONFIG.get("auto_check_updates")
+    def toggle_auto_update(self, _):
+        CONFIG["auto_update"] = not CONFIG.get("auto_update")
         save_config()
-        self.autoupd_item.state = int(CONFIG["auto_check_updates"])
+        self._sync_update_menu()
+        print("Автообновление " + ("включено" if CONFIG["auto_update"] else "выключено"),
+              flush=True)
+
+    def set_update_period(self, sender):
+        CONFIG["auto_update_every"] = sender._period
+        save_config()
+        self._sync_update_menu()
 
     def update_clicked(self, _):
-        """Кнопка делает ровно то, что на ней написано.
-
-        Нечего ставить — спрашиваем GitHub, и если что-то нашлось, СРАЗУ
-        показываем список изменений и предлагаем поставить: второй клик по той
-        же строке больше не нужен, а с ним ушло и окно «нажми ещё раз».
-        В сеть ходим только отсюда (и, если включена галка, один раз при
-        запуске) — программа слушает клавиатуру и микрофон, тихо подменять её
-        код нельзя."""
-        u = STATE.get("update") or {}
-        if u.get("busy"):
-            return  # запрос уже в полёте
-        if update_available(u):
-            self._offer_install(u)
-            return
-
-        from PyObjCTools import AppHelper
-
-        def probe():
-            STATE["update"] = {"busy": True}  # кнопка на это время гаснет
-            AppHelper.callAfter(self.refresh_about)  # сразу, а не по 5-с таймеру
-            res = check_update()
-            STATE["update"] = res
-            AppHelper.callAfter(self.refresh_about)
-            if res.get("error"):
-                notify_ui("Обновления",
-                          f"Не смог спросить GitHub: {res['error']}\n\n"
-                          "Проверь сеть и нажми «Проверить обновления» ещё раз. "
-                          "Установленная версия при этом работает как работала.")
-            elif update_available(res):
-                AppHelper.callAfter(self._offer_install, res)  # окна — с главного потока
-            else:
-                notify_ui("Обновления", f"Установлено: {app_version()}\n"
-                          "Это последняя версия — ставить нечего.")
-        threading.Thread(target=probe, daemon=True).start()
-
-    def _offer_install(self, u: dict):
-        """Что приедет, что при этом произойдёт, и одна кнопка установки."""
-        what = f"версии {u['tag']}" if u.get("tag") else "свежих правок с main"
-        log = u.get("log") or []
-        shown = log[:12]
-        changes = ("\n".join(f"• {l}" for l in shown)
-                   + (f"\n… и ещё {len(log) - len(shown)}" if len(log) > len(shown) else "")
-                   ) if log else "(список изменений получить не удалось)"
-        if rumps.alert("Обновление Dictate",
-                       f"Сейчас: {app_version()}.\nДоступно обновление до {what}.\n\n"
-                       f"Что изменилось:\n{changes}\n\n"
-                       "По кнопке: git pull (только перемотка), проверка компиляции, "
-                       "при смене зависимостей — uv sync, затем перезапуск службы. "
-                       "Если новая версия не соберётся — откат на текущую.\n"
-                       "Незакоммиченные правки не тронем — при их наличии откажусь.",
-                       ok="Установить и перезапустить", cancel="Позже") != 1:
-            return
-        def run():
-            # на время установки (до 600 с с uv sync) кнопка гаснет: второй клик
-            # запускал второй apply_update параллельно — гонка на .git/index.lock
-            # и откат одного прогона поверх pull другого
-            STATE["update"] = {**u, "busy": True, "installing": True}
-            msg = apply_update()
-            if (STATE.get("update") or {}).get("installing"):
-                STATE["update"] = u  # не поехало — кнопка снова предлагает установку
-            notify_ui("Обновление Dictate", msg)
-        threading.Thread(target=run, daemon=True).start()
-
-    def update_help(self, _):
-        rumps.alert("Как обновляется Dictate",
-                    "1. «Проверить обновления» — один запрос к GitHub. Сам в сеть я не "
-                    "хожу: только по этой кнопке и, если стоит галка, один раз через "
-                    "минуту после запуска.\n\n"
-                    "2. Если новое нашлось — строка «Обновления» скажет что именно, а "
-                    "кнопка станет «Установить …». Клик по ней покажет список изменений "
-                    "и спросит подтверждение; ничего не ставится молча.\n\n"
-                    "3. После установки служба перезапускается сама: несколько секунд без "
-                    "диктовки, модели греются заново. Не собралось — откат на текущую "
-                    "версию.\n\n"
-                    "⬆️ означает одно: есть что поставить или перезапустить. Она "
-                    "появляется на всём пути — в меню-баре, у «О программе» и на самой "
-                    "кнопке.\n\n"
-                    "«Перезапустить службу» нужен отдельно, когда код на диске новее "
-                    "работающего — например, после git pull руками. Тогда рядом с "
-                    "версией появится пометка «на диске новее».")
+        """Кнопка делает всё сама: спрашивает GitHub и, если есть новое, ставит
+        и перезапускает службу. Нет нового — окно «последняя версия»."""
+        if (STATE.get("update") or {}).get("busy"):
+            return  # проверка или установка уже идёт
+        threading.Thread(target=run_update, args=(True,), daemon=True).start()
 
     # --- мой голос ------------------------------------------------------------
     def _build_review_menu(self):
@@ -4044,8 +3991,8 @@ def code_updated_on_disk() -> bool:
 # GitHub API: репозиторий публичный — ключи/токены/агент не нужны, обновление не
 # зависит от dev-настроек (SSH только на pushurl); не ест лимит API (60 запросов
 # в час на IP) и не качает объекты — только список ссылок.
-# По умолчанию проверка ТОЛЬКО по кнопке; галка «Проверять при запуске» добавляет
-# ровно один такой запрос через минуту после старта. Установка — всегда вручную.
+# Проверка и установка — один проход (run_update): по кнопке «Обновить» или
+# из фонового цикла автообновления (auto_update_loop) раз в день/неделю/месяц.
 
 
 def _semver(tag: str):
@@ -4218,59 +4165,119 @@ def app_version_of(sha: str) -> str:
 
 
 def update_summary() -> str:
-    """Строка СОСТОЯНИЯ: что мы знаем про обновления. Без «нажми» — что делает
-    клик, написано на самой кнопке (update_action_label)."""
-    u = STATE.get("update")
-    if not u:
-        return "с запуска не проверялись"
+    """Строка СОСТОЯНИЯ для окна состояния: что мы знаем про обновления."""
+    u = STATE.get("update") or {}
     if u.get("installing"):
-        return "устанавливаю обновление…"
+        return "⬇️ ставлю новую версию…"
     if u.get("busy"):
         return "спрашиваю GitHub…"
-    when = time.strftime("%H:%M", time.localtime(u.get("checked", 0)))
+    auto = ("автообновление " + UPDATE_PERIODS[CONFIG["auto_update_every"]][0].lower()
+            if CONFIG.get("auto_update") else "автообновление выключено")
+    last = float(CONFIG.get("auto_update_last") or 0)
+    when = time.strftime("%d.%m %H:%M", time.localtime(last)) if last else "ещё не проверялось"
     if u.get("error"):
-        return f"не проверилось: {u['error']}"
+        return f"не проверилось: {u['error']} · {auto}"
     if u.get("tag"):
-        return f"⬆️ доступна {u['tag']}, установлена {VERSION} (проверено в {when})"
+        return f"⬆️ доступна {u['tag']}, установлена {VERSION} · {auto}"
     if u.get("commits"):
-        return f"⬆️ на main есть правки новее нашей копии (проверено в {when})"
-    return f"актуальная версия (проверено в {when})"
+        return f"⬆️ на main есть правки новее нашей копии · {auto}"
+    return f"{auto} · последняя проверка {when}"
 
 
 def update_action_label(short: bool = False) -> str:
-    """Что произойдёт по клику — ровно это и написано на кнопке.
-
-    short — для окна состояния: колонка кнопок там 190 px, длинная подпись
-    обрезается многоточием («Установить 0.14.0 и переза…»), а обрезанная кнопка
-    как раз и есть та самая непонятность «куда я жму»."""
+    """Что произойдёт по клику — ровно это и написано на кнопке."""
     u = STATE.get("update") or {}
     if u.get("installing"):
-        return "Устанавливаю…"
+        return "Обновляю…"
     if u.get("busy"):
         return "Спрашиваю GitHub…"
-    if u.get("tag"):
-        return f"⬆️ Установить {u['tag']}" + ("" if short else " и перезапустить…")
-    if u.get("commits"):
-        return "⬆️ Установить правки" + ("" if short else " с main…")
-    return "Проверить обновления"
+    return "Обновить"
 
 
-def auto_check_updates_later(delay: float = 60.0):
-    """Опциональная проверка при запуске: один ls-remote после прогрева моделей.
-    Результат — только пометка ⬆️ в меню; ничего не ставится."""
-    if not CONFIG.get("auto_check_updates"):
+def _refresh_about_soon():
+    """Перерисовать меню «О программе» из фонового потока (окна — с главного)."""
+    if APP is None:
         return
+    from PyObjCTools import AppHelper
+    AppHelper.callAfter(APP.refresh_about)
 
-    def run():
-        time.sleep(delay)
-        if STATE.get("update"):  # уже проверяли вручную — не дёргаем сеть зря
+
+def run_update(manual: bool) -> None:
+    """Один проход: спросить GitHub, если есть новое — поставить и перезапуститься.
+
+    manual — по кнопке: итог показываем окном. Автопроход молчит: итог только
+    в логе, а окно — лишь если установка не удалась (иначе ежедневные окна
+    «последняя версия» надоедят, а провал установки останется незамеченным)."""
+    u = STATE.get("update") or {}
+    if u.get("busy"):
+        return
+    STATE["update"] = {"busy": True}
+    _refresh_about_soon()
+    res = None
+    try:
+        res = check_update()
+        STATE["update"] = res
+        if res.get("error"):
+            print(f"Проверка обновлений: ошибка — {res['error']}", flush=True)
+            if manual:
+                notify_ui("Обновления",
+                          f"Не смог спросить GitHub: {res['error']}\n\n"
+                          "Проверь сеть и нажми «Обновить» ещё раз. "
+                          "Установленная версия при этом работает как работала.")
             return
-        STATE["update"] = {"busy": True}
-        STATE["update"] = check_update()
-        u = STATE["update"]
-        print("Проверка обновлений при запуске: "
-              + (f"ошибка — {u['error']}" if u.get("error") else update_summary()),
-              flush=True)
+        CONFIG["auto_update_last"] = time.time()  # удачная проверка — отсчёт периода отсюда
+        save_config()
+        if not update_available(res):
+            print(f"Проверка обновлений: установлена последняя версия ({app_version()})",
+                  flush=True)
+            if manual:
+                notify_ui("Обновления", f"Установлено: {app_version()}\n"
+                          "Это последняя версия — ставить нечего.")
+            return
+        what = f"версия {res['tag']}" if res.get("tag") else "свежие правки с main"
+        print(f"Обновление: доступна {what} — ставлю…", flush=True)
+        for line in (res.get("log") or [])[:12]:
+            print(f"  • {line}", flush=True)
+        STATE["update"] = {**res, "busy": True, "installing": True}
+        _refresh_about_soon()
+        msg = apply_update()
+        ok = msg.startswith("Обновлено")
+        print("Обновление: " + msg.replace("\n", " "), flush=True)
+        if not ok:
+            STATE["update"] = res  # не поехало — кнопка снова предлагает обновить
+        if manual or not ok:
+            notify_ui("Обновление Dictate", msg)
+    except Exception as e:
+        STATE["update"] = res or {"error": str(e)[:120]}
+        print(f"Обновление: сбой — {e}", flush=True)
+        if manual:
+            notify_ui("Обновление Dictate", f"Сбой: {e}")
+    finally:
+        _refresh_about_soon()
+
+
+def auto_update_loop(first_delay: float = 180.0, tick: float = 1800.0):
+    """Фоновое автообновление: раз в `tick` смотрим, не пора ли (по
+    auto_update_every и времени последней удачной проверки), и запускаем
+    run_update молча. Не лезем, пока модели грузятся, идёт запись или в очереди
+    есть диктовка — перезапуск службы посреди работы хуже опоздания на полчаса.
+    Первый заход — через first_delay после старта, чтобы не мешать прогреву."""
+    def run():
+        time.sleep(first_delay)
+        while True:
+            try:
+                if (CONFIG.get("auto_update") and not STATE.get("loading")
+                        and not recording and jobs.empty()
+                        and not (STATE.get("update") or {}).get("busy")):
+                    period = UPDATE_PERIODS.get(CONFIG.get("auto_update_every"),
+                                                UPDATE_PERIODS["day"])[1]
+                    last = float(CONFIG.get("auto_update_last") or 0)
+                    if time.time() - last >= period:
+                        print("Автообновление: пора проверить GitHub", flush=True)
+                        run_update(manual=False)
+            except Exception as e:
+                print(f"  автообновление: {e}", flush=True)
+            time.sleep(tick)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -4361,7 +4368,7 @@ def main():
     # таймауту (хоткей переставал работать до перезапуска)
     KeyListener(on_press=on_press, on_release=on_release).start()
     print(f"Меню-бар запущен. Зажми {HK.label} и говори; отпусти — текст вставится.")
-    auto_check_updates_later()  # выкл. по умолчанию; см. галку в «О программе»
+    auto_update_loop()  # галка «Автообновление» в «О программе»; период — там же
     DictateApp().run()
 
 
