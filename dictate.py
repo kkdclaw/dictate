@@ -88,7 +88,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.17.0"
+VERSION = "0.17.1"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -257,9 +257,8 @@ CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "hotkey": hotkey.DEFAULT,      # см. hotkey.py: «alt_r», «fn», «ctrl+space», «cmd+shift+d»…
           "restore_clipboard": True,     # после вставки вернуть в буфер то, что там лежало
           "commands": True,              # голосовые команды и сниппеты (commands.py)
-          "auto_update": True,           # молча проверять GitHub раз в auto_update_every и ставить новое
+          "auto_update": True,           # при запуске и дальше раз в auto_update_every молча ставить новое
           "auto_update_every": "day",    # "day" | "week" | "month" — см. UPDATE_PERIODS
-          "auto_update_last": 0.0,       # unix-время последней удачной проверки (переживает перезапуск)
           "default_terms": "",           # слой словаря по умолчанию ("" — только общий terms.txt)
           "terms_profiles": {},          # приложение -> слой словаря (как profiles для стилей)
           "unload_llm": False,           # выгружать модель чистки из памяти, пока она не нужна
@@ -340,8 +339,10 @@ def load_config():
         CONFIG["llm_idle_min"] = defaults["llm_idle_min"]
     if CONFIG.get("auto_update_every") not in UPDATE_PERIODS:
         CONFIG["auto_update_every"] = defaults["auto_update_every"]
-    # до 0.17 была галка «Проверять при запуске» — ничего не ставила, ключ больше не нужен
+    # до 0.17 была галка «Проверять при запуске» — ничего не ставила; в 0.17.0 отсчёт
+    # хранился на диске (auto_update_last) — теперь он от запуска процесса. Ключи не нужны
     CONFIG.pop("auto_check_updates", None)
+    CONFIG.pop("auto_update_last", None)
     if not isinstance(CONFIG.get("profiles"), dict):
         CONFIG["profiles"] = {}
     CONFIG["profiles"] = {a: st for a, st in CONFIG["profiles"].items()
@@ -4173,7 +4174,7 @@ def update_summary() -> str:
         return "спрашиваю GitHub…"
     auto = ("автообновление " + UPDATE_PERIODS[CONFIG["auto_update_every"]][0].lower()
             if CONFIG.get("auto_update") else "автообновление выключено")
-    last = float(CONFIG.get("auto_update_last") or 0)
+    last = STATE.get("update_last")
     when = time.strftime("%d.%m %H:%M", time.localtime(last)) if last else "ещё не проверялось"
     if u.get("error"):
         return f"не проверилось: {u['error']} · {auto}"
@@ -4225,8 +4226,7 @@ def run_update(manual: bool) -> None:
                           "Проверь сеть и нажми «Обновить» ещё раз. "
                           "Установленная версия при этом работает как работала.")
             return
-        CONFIG["auto_update_last"] = time.time()  # удачная проверка — отсчёт периода отсюда
-        save_config()
+        STATE["update_last"] = time.time()  # удачная проверка — отсчёт периода отсюда
         if not update_available(res):
             print(f"Проверка обновлений: установлена последняя версия ({app_version()})",
                   flush=True)
@@ -4257,11 +4257,14 @@ def run_update(manual: bool) -> None:
 
 
 def auto_update_loop(first_delay: float = 180.0, tick: float = 1800.0):
-    """Фоновое автообновление: раз в `tick` смотрим, не пора ли (по
-    auto_update_every и времени последней удачной проверки), и запускаем
-    run_update молча. Не лезем, пока модели грузятся, идёт запись или в очереди
-    есть диктовка — перезапуск службы посреди работы хуже опоздания на полчаса.
-    Первый заход — через first_delay после старта, чтобы не мешать прогреву."""
+    """Фоновое автообновление: проверка при каждом запуске (через first_delay,
+    чтобы не мешать прогреву), дальше — раз в auto_update_every (день / неделя
+    / месяц) от последней удачной проверки. Отсчёт живёт только в памяти:
+    перезапустился раньше срока — проверил заново, работает без перезапуска —
+    сработает таймер. Раз в `tick` смотрим, не пора ли. Не лезем, пока модели
+    грузятся, идёт запись или в очереди есть диктовка — перезапуск службы
+    посреди работы хуже опоздания на полчаса (проверка тогда переносится на
+    следующий тик, отсчёт не сдвигается)."""
     def run():
         time.sleep(first_delay)
         while True:
@@ -4271,9 +4274,10 @@ def auto_update_loop(first_delay: float = 180.0, tick: float = 1800.0):
                         and not (STATE.get("update") or {}).get("busy")):
                     period = UPDATE_PERIODS.get(CONFIG.get("auto_update_every"),
                                                 UPDATE_PERIODS["day"])[1]
-                    last = float(CONFIG.get("auto_update_last") or 0)
-                    if time.time() - last >= period:
-                        print("Автообновление: пора проверить GitHub", flush=True)
+                    last = STATE.get("update_last")
+                    if last is None or time.time() - last >= period:
+                        print("Автообновление: " + ("проверка при запуске" if last is None
+                              else "прошёл период — проверяю GitHub"), flush=True)
                         run_update(manual=False)
             except Exception as e:
                 print(f"  автообновление: {e}", flush=True)
