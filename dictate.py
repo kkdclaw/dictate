@@ -88,7 +88,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.17.1"
+VERSION = "0.17.2"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -578,6 +578,16 @@ stream_holder = {}  # текущий InputStream; пересоздаётся п�
 SILENT_PEAK = 1e-4      # блок тише этого считаем нулями
 SILENT_DEAD_SEC = 3.0   # столько нулей подряд при живом пульсе — переоткрываем по нажатию
 SILENT_WATCH_SEC = 20.0  # вочдог переоткрывает сам после стольких секунд нулей, ОДИН раз на эпизод
+# Не всякий уснувший линк отдаёт нули: Sony WH-1000XM5 в спящем HFP дают
+# собственный шумовой пол — RMS 0.0005, peak 0.0024 (замер 10.09.2026 на Studio,
+# наушники сняты после 16 мин простоя). Это в 24 раза выше SILENT_PEAK, поэтому
+# для колбэка, вочдога и ensure_stream микрофон «звучит» и переоткрытия не будет
+# никогда: диктовка за диктовкой уходили в пустоту. Поднимать SILENT_PEAK нельзя —
+# живой микрофон в тихой комнате даёт те же 1e-3…3e-3, и порог начал бы рвать
+# поток на каждой паузе. Ловим не по амплитуде в тишине, а по результату записи:
+# человек нажал и говорил, а пик всей записи не дотянул даже до шёпота — линк мёртв.
+EMPTY_CAPTURE_PEAK = 0.02  # пик записи ниже — захват пустой, а не тихая речь
+EMPTY_CAPTURE_MIN_SEC = 1.0  # короче — случайный тычок хоткея, линк не дёргаем
 
 
 import ctypes
@@ -806,6 +816,55 @@ def stream_alive() -> bool:
         return False
 
 
+LINK_REOPEN_GATE_SEC = 60.0  # не дёргаем Bluetooth-линк чаще: щелчок и потеря первой секунды
+
+
+def stream_refreshed_since(rec_end: float, trust_signal: bool) -> bool:
+    """Поток уже не тот, что писал эту запись: идёт новая, кто-то переоткрывает,
+    поток открыт заново — или (только для мёртвых нулей) в старом появился звук.
+
+    Задание могло долго ждать очереди за Whisper/LLM, и за это время поток мог
+    смениться; рвать живой поток из ML-потока нельзя — дыра в chunks, потерянные
+    слова, щелчок A2DP↔HFP. При пустом захвате last_signal не улика: шумовой пол
+    спящего линка обновляет его каждые 15 мс, и признак «звук пошёл» всегда врал бы.
+    """
+    if recording or reopen_lock.busy():
+        return True
+    if (stream_holder.get("opened") or 0.0) > rec_end:
+        return True
+    return trust_signal and (stream_holder.get("last_signal") or 0.0) > rec_end
+
+
+def recover_from_empty_capture(duration: float, rec_end: float) -> None:
+    """Захват вышел пустым (микрофон отдавал шумовой пол): переоткрыть линк.
+
+    Зовётся из ML-потока, поэтому осторожно: линк дёргаем не чаще
+    LINK_REOPEN_GATE_SEC, только если писали дольше EMPTY_CAPTURE_MIN_SEC
+    и поток с тех пор не сменился. Если переоткрытие уже было и не помогло —
+    говорим, куда смотреть, вместо второго щелчка A2DP↔HFP."""
+    if duration < EMPTY_CAPTURE_MIN_SEC:
+        return  # случайный тычок хоткея — не улика, линк не дёргаем
+    if stream_refreshed_since(rec_end, False):
+        return
+    if time.time() - stream_holder.get("link_reopen", 0) < LINK_REOPEN_GATE_SEC:
+        print("  переоткрытие только что было и не помогло — дело в самом устройстве: "
+              "наушники сняты или в кейсе, микрофон занят телефоном (мультипоинт) "
+              "или в «Звук» выбран не тот вход", flush=True)
+        return
+    stream_holder["link_reopen"] = time.time()
+    print("  переоткрываю поток — скажи ещё раз через пару секунд", flush=True)
+    try:
+        # follow_default: пробы устройств тут бесполезны — probe_rms видит тот же
+        # шумовой пол и считает спящий вход живым; если устройство пропало совсем,
+        # open_stream сам уйдёт в pick_device
+        reopen_stream(follow_default=True, force=True)
+    except NoMicrophone:
+        STATE["mic"] = "нет — подключи микрофон"
+        print("  микрофона нет — подключи AirPods или USB-микрофон", flush=True)
+    except Exception as e:
+        print(f"  не удалось переоткрыть: {e}", flush=True)
+
+
 def mic_silent_for() -> float:
     """Сколько секунд подряд поток отдаёт нули (пик блока < SILENT_PEAK); 0 — звук есть."""
     last = stream_holder.get("last_signal")
@@ -831,9 +890,9 @@ def ensure_stream():
         # в тишине точные нули, и без гейта каждое нажатие переоткрывало бы
         # поток (щелчок, потерянная первая секунда). Если после переоткрытия
         # звука всё равно нет, дальше разберётся ветка «запись пустая»
-        if time.time() - stream_holder.get("press_reopen", 0) < 60:
+        if time.time() - stream_holder.get("link_reopen", 0) < LINK_REOPEN_GATE_SEC:
             return
-        stream_holder["press_reopen"] = time.time()
+        stream_holder["link_reopen"] = time.time()
         print(f"  микрофон отдаёт нули уже {_fmt_secs(silent)} (Bluetooth-линк уснул "
               f"за простой?) — переоткрываю...", flush=True)
     else:
@@ -870,6 +929,7 @@ def open_stream(follow_default=False):
         stream_holder["stream"] = s
         stream_holder["name"] = name  # для дедупликации переоткрытий
         stream_holder["last_signal"] = time.time()  # отсчёт нулей — с открытия
+        stream_holder["opened"] = time.time()  # «поток уже не тот» для веток пустой записи
         try:  # список входов для окна состояния — обновляем, пока PortAudio наш
             _devices_cache["names"] = [d["name"] for d in sd.query_devices()
                                        if d["max_input_channels"] > 0]
@@ -2109,16 +2169,13 @@ def ml_worker(ready: threading.Event):
                       f"запись{since} (Bluetooth-линк уснул за простой? AirPods в кейсе "
                       f"или на другом устройстве?) — переоткрываю поток, скажи ещё раз "
                       f"через пару секунд", flush=True)
-                # Задание могло долго ждать в очереди за Whisper/LLM, и за это
-                # время поток уже переоткрыл ensure_stream по следующему
-                # нажатию, а то и идёт запись. Рвать живой поток из ML-потока
-                # нельзя: дыра в chunks, потерянные слова, щелчок A2DP↔HFP.
+                hud.play("error")  # молча потерянная диктовка выглядит как «хоткей не сработал»
                 # last_signal новее конца записи = звук пошёл или поток открыт
-                # заново (open_stream ставит его при открытии)
-                last = stream_holder.get("last_signal") or 0.0
-                if recording or reopen_lock.busy() or last > rec_end:
+                # заново; при нулях его двигают только эти два события
+                if stream_refreshed_since(rec_end, True):
                     print("  поток уже ожил или переоткрыт — не трогаю", flush=True)
                     continue
+                stream_holder["link_reopen"] = time.time()  # линк дёрнут: гейт общий на всех
                 try:
                     reopen_stream(force=True)  # force: по пульсу поток «жив», без него холостой
                 except Exception as e:
@@ -2145,10 +2202,18 @@ def ml_worker(ready: threading.Event):
             if not spans:
                 rms = float(np.sqrt((audio ** 2).mean()))
                 peak = float(np.abs(audio).max())
-                hint = ("захват почти пустой — микрофон не тот/тихий, "
-                        if peak < 0.02 else "сигнал есть, но VAD не распознал речь, ")
-                print(f"  ✗ речи не слышно ({hint}RMS={rms:.4f} peak={peak:.3f}) — "
+                if peak >= EMPTY_CAPTURE_PEAK:
+                    print(f"  ✗ речи не слышно (сигнал есть, но VAD не распознал речь, "
+                          f"RMS={rms:.4f} peak={peak:.3f}) — не вставляю", flush=True)
+                    continue
+                # Пик не дотянул даже до шёпота: устройство отдавало свой шумовой
+                # пол, а не голос. Нулей при этом нет, поэтому ни вочдог, ни
+                # ensure_stream линк не починят — чиним здесь, по результату записи
+                print(f"  ✗ речи не слышно: захват пустой — микрофон «{STATE['mic']}» "
+                      f"отдавал один шумовой пол (RMS={rms:.4f} peak={peak:.3f}), "
                       f"не вставляю", flush=True)
+                hud.play("error")  # иначе неотличимо от «хоткей не сработал»
+                recover_from_empty_capture(duration, rec_end)
                 continue
             audio = audio[max(0, spans[0]["start"] - SAMPLE_RATE // 4):
                           spans[-1]["end"] + SAMPLE_RATE // 10]
