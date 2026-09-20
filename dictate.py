@@ -88,7 +88,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.17.2"
+VERSION = "0.18.0"
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -261,6 +261,7 @@ CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "auto_update_every": "day",    # "day" | "week" | "month" — см. UPDATE_PERIODS
           "default_terms": "",           # слой словаря по умолчанию ("" — только общий terms.txt)
           "terms_profiles": {},          # приложение -> слой словаря (как profiles для стилей)
+          "enabled": True,               # False — служба стоит пустой: ни моделей, ни микрофона, ни хоткея
           "unload_llm": False,           # выгружать модель чистки из памяти, пока она не нужна
           "llm_idle_min": 10,            # столько минут без чистки — и выгружаем
           "review": False,               # окно постобработки: спрашивать, какой вариант вставить
@@ -2612,6 +2613,8 @@ class DictateApp(rumps.App):
         global APP
         super().__init__("Dictate", title="⏳", quit_button=rumps.MenuItem("Выход"))
         APP = self
+        self.power_item = rumps.MenuItem("Диктовка включена", callback=self.toggle_enabled)
+        self.power_item.state = int(CONFIG["enabled"])
         self.mic_item = rumps.MenuItem("Микрофон: …")
         self.recent = rumps.MenuItem("Последние (клик — скопировать)")
         self.recent.add(rumps.MenuItem("пусто"))
@@ -2659,7 +2662,7 @@ class DictateApp(rumps.App):
         self.cmd_menu.add(rumps.MenuItem("Список команд…", callback=self.show_commands))
         self.cmd_menu.add(rumps.MenuItem("Файл команд и сниппетов…", callback=self.open_commands))
 
-        self.menu = [self.status_item, self.perm_item, self.mic_item, self.recent, None,
+        self.menu = [self.power_item, None, self.status_item, self.perm_item, self.mic_item, self.recent, None,
                      self.profile, self.default_style, self.review_menu,
                      self.translate_item, self.lang_menu, None,
                      self.voice_menu,
@@ -3186,6 +3189,8 @@ class DictateApp(rumps.App):
         need_restart = perms_need_restart()
         if STATE["error"]:
             svc = f"❌ {STATE['error']}"
+        elif not CONFIG["enabled"]:
+            svc = "🌙 Диктовка выключена — включи первой строкой меню"
         elif need_restart:
             svc = ("⚠️ Разрешения выданы, но не применены: " + ", ".join(need_restart)
                    + " — нажми «Перезапустить»")
@@ -3291,7 +3296,8 @@ class DictateApp(rumps.App):
                   else f"⚠️ скачан частично ({_fmt_mb(ec['mb'])} из ~{_fmt_mb(ECAPA[1])})"
                   if ec["state"] == "partial"
                   else f"○ не скачан (~{_fmt_mb(ECAPA[1])})")
-        vad_txt = "● загружен" if not STATE["loading"] else "⏳ грузится"
+        vad_txt = ("○ выключен" if not CONFIG["enabled"]
+                   else "● загружен" if not STATE["loading"] else "⏳ грузится")
         mrows.append(("Служебные", f"Отпечаток голоса ECAPA: {ec_txt} · Silero VAD: {vad_txt}",
                       "Открыть кэш", "cache"))
         # --- хоткей ---
@@ -3454,6 +3460,8 @@ class DictateApp(rumps.App):
         # ❌ — модели не загрузились; ⚠️ — поток мёртв/переоткрывается
         if STATE["error"]:
             title = "❌"
+        elif not CONFIG["enabled"]:
+            title = "🌙"
         elif STATE["loading"]:
             # ⏳ с номером этапа читается как «сейчас поедет» — верно, когда модели
             # на диске и идёт загрузка в память. Пока они качаются, это неправда:
@@ -3544,6 +3552,9 @@ class DictateApp(rumps.App):
         успевает прочитать текст и приготовиться."""
         if recording or enroll_buf["on"]:
             rumps.alert("Отпечаток голоса", "Идёт другая запись — дождись конца.")
+            return
+        if not CONFIG["enabled"]:
+            rumps.alert("Отпечаток голоса", "Диктовка выключена — сначала включи её.")
             return
         if STATE["loading"]:
             rumps.alert("Отпечаток голоса",
@@ -3681,6 +3692,19 @@ class DictateApp(rumps.App):
         sender.state = int(STATE["enhance"])
         CONFIG["enhance"] = STATE["enhance"]  # иначе сбрасывается при рестарте
         save_config()
+
+    def toggle_enabled(self, sender):
+        """Выключатель целиком. Выгружать по частям бессмысленно: torch, ONNX и
+        пул Metal память системе не возвращают, пока жив процесс. Поэтому
+        пишем флаг и перезапускаемся: выключенная служба стартует пустой —
+        без моделей, микрофона и слушателя клавиш (см. main)."""
+        if recording:
+            cancel_recording(reason="диктовку выключают")
+        CONFIG["enabled"] = not CONFIG["enabled"]
+        save_config()
+        print("Диктовка " + ("включена" if CONFIG["enabled"] else "выключена")
+              + " из меню — перезапускаюсь", flush=True)
+        restart_app()
 
     def toggle_unload_llm(self, sender):
         """Держать модель чистки в памяти или подбирать её по требованию.
@@ -4413,6 +4437,16 @@ def _open_stream_quiet():
 def main():
     print(f"Dictate {app_version()}", flush=True)  # первой строкой лога: что именно запустилось
     load_config()
+    if not CONFIG["enabled"]:
+        # выключено из меню: остаётся только значок с выключателем. Ничего не
+        # грузим и не слушаем — ни моделей, ни микрофона (нет оранжевой точки),
+        # ни клавиш; включение — тот же пункт меню, он перезапустит службу
+        STATE.update(loading=False, mic="выключен")
+        print("Диктовка выключена (пункт «Диктовка включена» в меню) — модели, "
+              "микрофон и хоткей не трогаю.", flush=True)
+        auto_update_loop()
+        DictateApp().run()
+        return
     missing = check_permissions_at_start()
     ask_first_download()
     # окно состояния при старте: нет разрешений или активные модели ещё не на диске
