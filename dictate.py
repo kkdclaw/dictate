@@ -88,7 +88,8 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.18.0"
+VERSION = "0.18.1"
+REPO_HTTPS = "https://github.com/kkdclaw/dictate.git"  # откуда обновляемся: без ключей
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 # Язык распознавания — CONFIG["asr_language"]: "ru" | "en" | "" (автоопределение).
@@ -4103,6 +4104,42 @@ def _tool_env(connect_timeout: int = 5) -> dict:
             "GIT_SSH_COMMAND": f"ssh -o BatchMode=yes -o ConnectTimeout={connect_timeout}"}
 
 
+def _ensure_https_fetch(env: dict) -> None:
+    """Fetch-URL origin должен быть HTTPS: обновление идёт из демона launchd, где
+    нет агента 1Password, и SSH-remote (git@github.com:…) молча падает
+    «Permission denied (publickey)» — так MacBook Pro неделю сидел на старой
+    версии. Клон по SSH (dev-машина) чиним сами: fetch → HTTPS, старый SSH-адрес
+    остаётся pushurl'ом, push для разработки как работал, так и работает."""
+    try:
+        r = subprocess.run(["git", "-C", BASE, "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=3, env=env)
+        cur = r.stdout.strip() if r.returncode == 0 else ""
+        if not cur or cur.startswith("https://"):
+            return
+        p = subprocess.run(["git", "-C", BASE, "remote", "get-url", "--push", "origin"],
+                           capture_output=True, text=True, timeout=3, env=env)
+        push = p.stdout.strip() if p.returncode == 0 else cur
+        subprocess.run(["git", "-C", BASE, "remote", "set-url", "origin", REPO_HTTPS],
+                       capture_output=True, timeout=3, env=env, check=True)
+        subprocess.run(["git", "-C", BASE, "remote", "set-url", "--push", "origin", push],
+                       capture_output=True, timeout=3, env=env, check=True)
+        print(f"Обновления: origin был {cur} — fetch переведён на {REPO_HTTPS}, "
+              f"push оставлен {push}", flush=True)
+    except Exception as e:
+        print(f"Обновления: не смог поправить remote origin ({e})", flush=True)
+
+
+def _git_error(stderr: str) -> str:
+    """Причина отказа git одной строкой: не последняя строка подсказки
+    («and the repository exists.»), а та, где сама ошибка."""
+    lines = [l.strip() for l in stderr.strip().splitlines() if l.strip()]
+    for l in lines:
+        if re.search(r"Permission denied|Could not resolve|Could not read|"
+                     r"Connection|timed out|fatal:|error:", l):
+            return l[:120]
+    return (lines or ["нет связи"])[-1][:120]
+
+
 def _uv_bin() -> str | None:
     """Где uv: PATH демона его обычно не содержит — смотрим в обычных местах."""
     import shutil
@@ -4130,12 +4167,13 @@ def check_update() -> dict:
     и кладём список коммитов в "log": его покажем перед кнопкой «Обновить».
     """
     env = _tool_env(5)
+    _ensure_https_fetch(env)
     try:
         r = subprocess.run(["git", "-C", BASE, "ls-remote", "--tags", "--refs",
                             "--heads", "origin"], capture_output=True, text=True,
                            timeout=20, env=env)
         if r.returncode != 0:
-            return {"error": (r.stderr.strip().splitlines() or ["нет связи"])[-1][:120]}
+            return {"error": _git_error(r.stderr)}
     except subprocess.TimeoutExpired:
         return {"error": "GitHub не ответил за 20 с"}
     except Exception as e:
