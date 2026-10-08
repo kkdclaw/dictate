@@ -89,7 +89,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.20.0"
+VERSION = "0.21.0"
 REPO_HTTPS = "https://github.com/kkdclaw/dictate.git"  # откуда обновляемся: без ключей
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
@@ -269,6 +269,8 @@ CONFIG = {"default_style": "clean", "profiles": {}, "only_my_voice": False,
           "enabled": True,               # False — служба стоит пустой: ни моделей, ни микрофона, ни хоткея
           "unload_llm": False,           # выгружать модель чистки из памяти, пока она не нужна
           "llm_idle_min": 10,            # столько минут без чистки — и выгружаем
+          "keep_audio": False,           # хранить wav каждой диктовки в audio/<id истории>.wav — для сравнения моделей
+          "audio_max_mb": 2000,          # потолок папки audio/: сверх него удаляются самые старые
           "review": False,               # окно постобработки: спрашивать, какой вариант вставить
           # ячейки стилей окна постобработки; None — ячейка выключена и строки в окне нет
           "review_styles": ["formal", "informal", "brief", None],
@@ -1132,6 +1134,52 @@ def load_terms(layer: str = "") -> str:
         total += n
     return ", ".join(out)
 
+
+
+AUDIO_DIR = os.path.join(BASE, "audio")  # wav диктовок при галке «Хранить аудио диктовок»
+
+
+def save_audio(row_id: int, audio) -> str:
+    """Сохранить массив 16 кГц в audio/<id>.wav (PCM16); id — строка истории,
+    по нему compare_asr.py находит текст и приложение. Сверх audio_max_mb
+    удаляются самые старые файлы."""
+    import wave
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    path = os.path.join(AUDIO_DIR, f"{row_id}.wav")
+    pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767).astype(np.int16)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(pcm.tobytes())
+    audio_rotate()
+    return path
+
+
+def audio_files() -> list:
+    try:
+        names = [n for n in os.listdir(AUDIO_DIR) if n.endswith(".wav")]
+    except FileNotFoundError:
+        return []
+    return sorted((os.path.join(AUDIO_DIR, n) for n in names), key=os.path.getmtime)
+
+
+def audio_stats() -> tuple:
+    """(файлов, МБ) в папке аудио."""
+    files = audio_files()
+    return len(files), sum(os.path.getsize(p) for p in files) / 1e6
+
+
+def audio_rotate():
+    cap = CONFIG.get("audio_max_mb") or 0
+    if cap <= 0:
+        return
+    files = audio_files()
+    total = sum(os.path.getsize(p) for p in files)
+    while files and total > cap * 1e6:
+        p = files.pop(0)
+        total -= os.path.getsize(p)
+        os.remove(p)
 
 
 PK = {"model": None, "repo": None}  # держатель Parakeet — второй движок распознавания
@@ -2099,7 +2147,7 @@ def ml_worker(ready: threading.Event):
     def store(rec):
         """История + строка в лог. Общая для обычной вставки и для выбора
         в окне постобработки: иначе половина диктовок не попадала бы в поиск."""
-        db.execute(
+        cur = db.execute(
             "INSERT INTO transcriptions (ts, text, raw_text, duration, app, "
             "style, asr_ms, llm_ms, gen_tps, gen_tokens, vp_sim) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2107,6 +2155,12 @@ def ml_worker(ready: threading.Event):
              rec["style"], rec["asr_ms"], rec["llm_ms"], rec["gen_tps"],
              rec["gen_tokens"], rec["vp_sim"]))
         db.commit()
+        audio = rec.pop("audio", None)  # массив не держим в записи дольше нужного
+        if audio is not None and CONFIG.get("keep_audio") and cur.lastrowid:
+            try:
+                save_audio(cur.lastrowid, audio)
+            except Exception as e:  # noqa
+                print(f"  аудио не сохранилось: {e}", flush=True)
         raw, text, doubtful = rec["raw"], rec["text"], rec.get("doubtful") or []
         mark = "" if text == strip_short_period(raw) else f"  (сырой: {raw})"
         doubt = f"  [сомнения: {', '.join(doubtful[:5])}]" if doubtful else ""
@@ -2404,7 +2458,8 @@ def ml_worker(ready: threading.Event):
                    "llm_ms": round(t_llm * 1000), "gen_tps": last_stats.get("gen_tps"),
                    "llm_load_s": last_stats.get("load_s"),
                    "gen_tokens": last_stats.get("gen_tokens"), "vp_sim": vp_sim,
-                   "doubtful": list(doubtful), "lang": CONFIG["asr_language"]}
+                   "doubtful": list(doubtful), "lang": CONFIG["asr_language"],
+                   "audio": audio if CONFIG.get("keep_audio") else None}
             if CONFIG["review"] and not cmd:
                 # с голосовой командой окно не показываем: команда («отправь»,
                 # «удали») выполняется сразу после вставки, а вставка тут уезжает
@@ -2729,6 +2784,9 @@ class DictateApp(rumps.App):
         self.clip_item = rumps.MenuItem("Возвращать буфер обмена после вставки",
                                         callback=self.toggle_restore_clipboard)
         self.clip_item.state = int(CONFIG["restore_clipboard"])
+        self.audio_item = rumps.MenuItem("Хранить аудио диктовок (для сравнения моделей)",
+                                         callback=self.toggle_keep_audio)
+        self.audio_item.state = int(CONFIG.get("keep_audio", False))
         self.cmd_menu = rumps.MenuItem("Команды и сниппеты")
         self.cmd_on = rumps.MenuItem("Голосовые команды включены", callback=self.toggle_commands)
         self.cmd_on.state = int(CONFIG["commands"])
@@ -2746,6 +2804,7 @@ class DictateApp(rumps.App):
                      self.enh_item,
                      self.unload_item,
                      self.clip_item,
+                     self.audio_item,
                      self.hud_menu,
                      self.models_menu,
                      rumps.MenuItem("Статистика…", callback=self.open_stats),
@@ -3114,6 +3173,15 @@ class DictateApp(rumps.App):
         save_config()
         self.clip_item.state = int(CONFIG["restore_clipboard"])
 
+    def toggle_keep_audio(self, _):
+        CONFIG["keep_audio"] = not CONFIG.get("keep_audio")
+        save_config()
+        self.audio_item.state = int(CONFIG["keep_audio"])
+        n, mb = audio_stats()
+        print(("Хранение аудио включено: каждая диктовка → audio/<id>.wav"
+               if CONFIG["keep_audio"] else "Хранение аудио выключено (записанное остаётся)")
+              + f" · сейчас {n} файлов, {mb:.0f} МБ", flush=True)
+
     def _build_hud_menu(self):
         m = rumps.MenuItem("Индикатор и звуки")
         self.hud_on = rumps.MenuItem("Показывать капсулу при записи", callback=self.toggle_hud)
@@ -3208,6 +3276,8 @@ class DictateApp(rumps.App):
             "reveal": reveal_binary,
             "cache": lambda: subprocess.run(["open", os.path.dirname(_repo_dir("x/y"))]),
             "models": lambda: self.open_models(None),
+            "audio_dir": lambda: (os.makedirs(AUDIO_DIR, exist_ok=True),
+                                  subprocess.run(["open", AUDIO_DIR])),
             "perm:Микрофон": lambda: request_permission("Микрофон"),
             "perm:Мониторинг ввода": lambda: request_permission("Мониторинг ввода"),
             "perm:Универсальный доступ": lambda: request_permission("Универсальный доступ"),
@@ -3295,6 +3365,15 @@ class DictateApp(rumps.App):
                 if CONFIG["restore_clipboard"] else ""),
              "Сменить…", "hotkey"),
         ]
+        n_wav, mb_wav = audio_stats()
+        if CONFIG.get("keep_audio"):
+            atxt = (f"● хранится: {n_wav} файлов · {mb_wav:.0f} МБ (потолок "
+                    f"{CONFIG.get('audio_max_mb', 0)} МБ, старше удаляются) · "
+                    "сравнить модели: uv run compare_asr.py")
+        else:
+            atxt = ("○ выключено — галка «Хранить аудио диктовок» в меню"
+                    + (f" · в папке осталось {n_wav} файлов, {mb_wav:.0f} МБ" if n_wav else ""))
+        service.append(("Аудио диктовок", atxt, "Папка", "audio_dir"))
         # --- разрешения ---
         icons = {"ok": "✅ выдано",
                  "restart": "☑️ галка включена, но применится после перезапуска службы",
