@@ -89,7 +89,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.19.2"
+VERSION = "0.20.0"
 REPO_HTTPS = "https://github.com/kkdclaw/dictate.git"  # откуда обновляемся: без ключей
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
@@ -211,6 +211,9 @@ ROLES = {  # роль -> (заголовок раздела, [(HF-репозит
          "Whisper large-v3 Russian — дообучена на русском; термины латиницей может ломать"),
         ("mlx-community/whisper-large-v3-turbo-q4", 500,
          "Whisper turbo 4-bit — для слабых машин, качество почти turbo"),
+        ("mlx-community/parakeet-tdt-0.6b-v3", 2400,
+         "Parakeet TDT 0.6B v3 (NVIDIA) — не Whisper: без словаря-подсказки, "
+         "термины пишет кириллицей, очень быстрая; стандарт у конкурентов"),
     ]),
     "llm": ("Чистка текста", [
         ("mlx-community/Qwen3-4B-Instruct-2507-4bit", 2300,
@@ -1131,6 +1134,49 @@ def load_terms(layer: str = "") -> str:
 
 
 
+PK = {"model": None, "repo": None}  # держатель Parakeet — второй движок распознавания
+
+
+def asr_engine(repo: str = None) -> str:
+    """«whisper» (mlx-whisper: словарь через initial_prompt, вероятности слов) или
+    «parakeet» (parakeet-mlx, NVIDIA TDT: подсказки нет, уверенность по токенам есть)."""
+    return "parakeet" if "parakeet" in (repo or ASR_MODEL).lower() else "whisper"
+
+
+def parakeet_load(repo: str):
+    """Загрузить Parakeet и прогреть: первый generate компилирует графы (~1 с)."""
+    from parakeet_mlx import from_pretrained
+    if PK["repo"] != repo or PK["model"] is None:
+        PK["model"] = from_pretrained(repo)
+        PK["repo"] = repo
+        parakeet_transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32))
+    return PK["model"]
+
+
+def parakeet_transcribe(audio: np.ndarray) -> dict:
+    """Распознать массив 16 кГц Parakeet'ом и отдать результат в формате Whisper:
+    text + segments[{text, words[{word, probability}]}] — чтобы сомнения,
+    strip_loops и остальной путь не знали, какой движок внизу. Слово = токены
+    до следующего токена с ведущим пробелом, вероятность = минимум по токенам."""
+    from parakeet_mlx.audio import get_logmel
+    m = PK["model"]
+    mel = get_logmel(mx.array(audio.astype(np.float32)), m.preprocessor_config)
+    res = m.generate(mel)[0]
+    segments = []
+    for sent in res.sentences:
+        words, cur, conf = [], "", 1.0
+        for t in sent.tokens:
+            if t.text.startswith(" ") and cur:
+                words.append({"word": cur, "probability": conf})
+                cur, conf = "", 1.0
+            cur += t.text
+            conf = min(conf, float(t.confidence))
+        if cur:
+            words.append({"word": cur, "probability": conf})
+        segments.append({"text": sent.text, "words": words, "no_speech_prob": 0.0})
+    return {"text": res.text, "segments": segments}
+
+
 def asr_hint(app: str = "") -> str:
     """Словарь в initial_prompt: Whisper подхватывает термины при распознавании.
 
@@ -1661,7 +1707,10 @@ def ml_worker(ready: threading.Event):
                                              savedir=os.path.join(BASE, "models/ecapa"))
         load_stage(3, f"распознавание: {ASR_MODEL.split('/')[-1]}",
                    ASR_MODEL, _full_mb("asr", ASR_MODEL))
-        ModelHolder.get_model(ASR_MODEL, mx.float16)
+        if asr_engine() == "parakeet":
+            parakeet_load(ASR_MODEL)
+        else:
+            ModelHolder.get_model(ASR_MODEL, mx.float16)
         from mlx_lm import stream_generate
         from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
         # размер берём из ROLES: на большой модели этап идёт минутами, и человек
@@ -1825,6 +1874,17 @@ def ml_worker(ready: threading.Event):
         # состояния (иначе иконка вечно «⏳», а нажатия копятся в очереди)
         import traceback
         traceback.print_exc()
+        if asr_engine() == "parakeet" and PK["model"] is None:
+            default_asr = ROLES["asr"][1][0][0]
+            print(f"✗ Parakeet {ASR_MODEL.split('/')[-1]} не загрузился: {e}\n"
+                  f"  Возвращаю {default_asr.split('/')[-1]} и перезапускаюсь.", flush=True)
+            CONFIG["asr_model"] = default_asr
+            save_config()
+            notify_ui("Модель не загрузилась",
+                      f"{e}\n\nВернул распознавание по умолчанию "
+                      f"({default_asr.split('/')[-1]}) и перезапускаю службу.")
+            restart_app()
+            return
         fallback = ROLES["llm"][1][0][0]  # первая в списке — модель по умолчанию
         if CONFIG["llm_model"] != fallback:
             # выбранная в меню модель не поехала: без отката диктовка мертва до
@@ -2254,10 +2314,13 @@ def ml_worker(ready: threading.Event):
             layer = terms_layer_for(app)
             t0 = time.time()
             try:
-                result = mlx_whisper.transcribe(
-                    audio, path_or_hf_repo=ASR_MODEL,
-                    language=CONFIG["asr_language"] or None,
-                    initial_prompt=asr_hint(app) or None, word_timestamps=True)
+                if asr_engine() == "parakeet":  # язык определяет сам, подсказки нет
+                    result = parakeet_transcribe(audio)
+                else:
+                    result = mlx_whisper.transcribe(
+                        audio, path_or_hf_repo=ASR_MODEL,
+                        language=CONFIG["asr_language"] or None,
+                        initial_prompt=asr_hint(app) or None, word_timestamps=True)
                 raw = result["text"].strip()
             except Exception as e:
                 print(f"  ошибка распознавания: {e}", flush=True)
@@ -3419,7 +3482,9 @@ class DictateApp(rumps.App):
                 note += (f" · выгружается после {CONFIG['llm_idle_min']} мин простоя"
                          if CONFIG["unload_llm"] else " · держится в памяти постоянно")
             elif role == "asr":
-                note += f" · язык: {CONFIG['asr_language'] or 'авто'}"
+                note += (" · язык определяет сама, словарь-подсказка не применяется (Parakeet)"
+                         if asr_engine(active) == "parakeet"
+                         else f" · язык: {CONFIG['asr_language'] or 'авто'}")
             sections.append({"title": title, "note": note, "rows": rows})
         # служебные: отпечаток голоса и детектор речи
         ec = _repo_status(*ECAPA)

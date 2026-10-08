@@ -1,6 +1,6 @@
 [project]
 name = "dictate"
-version = "0.19.2"  # синхронно с VERSION в dictate.py и git-тегом vX.Y.Z
+version = "0.20.0"  # синхронно с VERSION в dictate.py и git-тегом vX.Y.Z
 description = "Локальная push-to-talk диктовка для macOS (Whisper + Qwen на MLX)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,4 +20,5 @@ dependencies = [
     "soundfile>=0.14.0",
     "speechbrain>=1.1.0",
     "torchaudio>=2.11.0",
+    "parakeet-mlx>=0.5.3",
 ]
