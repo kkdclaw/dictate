@@ -35,6 +35,7 @@ from AppKit import NSWorkspace, NSPasteboard, NSPasteboardItem, NSPasteboardType
 import webwindow
 import hud
 import statuspanel
+import modelswindow
 import enrollwindow
 import hotkey
 import hotkeywindow
@@ -88,7 +89,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.18.1"
+VERSION = "0.19.0"
 REPO_HTTPS = "https://github.com/kkdclaw/dictate.git"  # откуда обновляемся: без ключей
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
@@ -488,25 +489,22 @@ def _repo_status(repo: str, full_mb, max_age=3.0) -> dict:
     return st
 
 
-def _model_row(label: str, st: dict, active: bool, repo: str = "") -> str:
-    mark = "●" if active else "○"
-    if st["state"] == "done":
-        size = _fmt_mb(st["mb"])
-    elif st["state"] == "loading":
-        size = "⬇️ " + dl_text(DL.get(repo) or st)
-    elif st["state"] == "partial":
-        size = f"⚠️ скачана частично ({_fmt_mb(st['mb'])} из ~{_fmt_mb(st['full'])})"
-    else:
-        size = f"не скачана (~{_fmt_mb(st['full'])})"
-    return f"{mark} {label} · {size}"
-
-
 def _full_mb(role: str, repo: str) -> float:
     """Ожидаемый размер модели из ROLES — знать его надо до того, как она скачана."""
     return next((f for r, f, _ in ROLES[role][1] if r == repo), 0)
 
 
+def _catalog_full(repo: str) -> float:
+    """Ожидаемый размер по каталогу ROLES/ECAPA (0 — модель не из каталога)."""
+    for _, options in ROLES.values():
+        for r, f, _ in options:
+            if r == repo:
+                return f
+    return ECAPA[1] if repo == ECAPA[0] else 0
+
+
 DL = {}  # repo -> {"mb", "full", "speed", "eta"}; заполняет download_watch
+MANUAL_DL = set()  # репо, которые качаются по кнопке окна «Модели» (не активные)
 
 
 def download_watch():
@@ -528,6 +526,8 @@ def download_watch():
         for role, cfg_key in ROLE_CFG.items():
             watched.setdefault(CONFIG[cfg_key], _full_mb(role, CONFIG[cfg_key]))
         watched.setdefault(*ECAPA)
+        for repo in list(MANUAL_DL):
+            watched.setdefault(repo, _catalog_full(repo))
         for repo, full in watched.items():
             st = _repo_status(repo, full, max_age=0)
             if st["state"] != "loading":
@@ -2647,7 +2647,7 @@ class DictateApp(rumps.App):
         self.voice_menu = self._build_voice_menu()
 
         self.terms_menu = self._build_terms_menu()
-        self.models_menu = rumps.MenuItem("Модели")
+        self.models_menu = rumps.MenuItem("Модели…", callback=self.open_models)
         self.about_item = self._build_about_menu()
         self.status_item = rumps.MenuItem("Состояние и разрешения…", callback=self.open_status)
         self.perm_item = rumps.MenuItem("Настроить разрешения…", callback=self.open_perm_wizard)
@@ -2683,7 +2683,7 @@ class DictateApp(rumps.App):
         rumps.Timer(self.refresh_title, 0.3).start()
         rumps.Timer(self.refresh_recent, 3.0).start()
         self.refresh_models(None)
-        rumps.Timer(self.refresh_models, 5.0).start()
+        rumps.Timer(self.refresh_models, 2.0).start()  # подпись пункта + окно «Модели»
         rumps.Timer(self.refresh_status, 1.0).start()
         self.refresh_voice_menu()
         rumps.Timer(self.refresh_voice_menu, 3.0).start()
@@ -3134,6 +3134,7 @@ class DictateApp(rumps.App):
                                                daemon=True).start(),
             "reveal": reveal_binary,
             "cache": lambda: subprocess.run(["open", os.path.dirname(_repo_dir("x/y"))]),
+            "models": lambda: self.open_models(None),
             "perm:Микрофон": lambda: request_permission("Микрофон"),
             "perm:Мониторинг ввода": lambda: request_permission("Мониторинг ввода"),
             "perm:Универсальный доступ": lambda: request_permission("Универсальный доступ"),
@@ -3147,10 +3148,7 @@ class DictateApp(rumps.App):
         })
 
     def _download_role(self, role):
-        repo = CONFIG[ROLE_CFG[role]]
-        it = rumps.MenuItem(repo)
-        it._repo = repo
-        self.download_model(it)
+        self._model_download(CONFIG[ROLE_CFG[role]])
 
     def refresh_status(self, _):
         # окно закрыто — снимок не собираем (в нём вызовы TCC/PortAudio),
@@ -3300,7 +3298,7 @@ class DictateApp(rumps.App):
         vad_txt = ("○ выключен" if not CONFIG["enabled"]
                    else "● загружен" if not STATE["loading"] else "⏳ грузится")
         mrows.append(("Служебные", f"Отпечаток голоса ECAPA: {ec_txt} · Silero VAD: {vad_txt}",
-                      "Открыть кэш", "cache"))
+                      "Все модели…", "models"))
         # --- хоткей ---
         last = STATE["last_hotkey"]
         if last:
@@ -3332,93 +3330,150 @@ class DictateApp(rumps.App):
         return [("Служба", service), ("Разрешения", prows), ("Микрофон", mic),
                 ("Мой голос", vrows), ("Модели", mrows), ("Хоткей и индикатор", hot)]
 
+    # ---------- модели: пункт меню, окно и действия ----------
     def refresh_models(self, _):
+        """Подпись пункта меню по состоянию активных моделей + обновление окна."""
         try:
-            snapshot = []  # (роль, заголовок, [(репо, подпись, статус, активна)])
-            for role, (title, options) in ROLES.items():
-                active = CONFIG[ROLE_CFG[role]]
-                rows = [(repo, label, _repo_status(repo, full), repo == active)
-                        for repo, full, label in options]
-                snapshot.append((role, title, rows))
-            aux = [("ECAPA-voxceleb — отпечаток голоса",
-                    _repo_status(*ECAPA))]
-            try:  # Silero VAD едет внутри pip-пакета, отдельно не скачивается
-                import silero_vad
-                d = os.path.dirname(silero_vad.__file__)
-                aux.append(("Silero VAD — детектор речи (в пакете)",
-                            {"path": d, "state": "done", "mb": _dir_size_mb(d),
-                             "full": None}))
-            except ImportError:
-                pass
+            states = [_repo_status(CONFIG[k], _full_mb(role, CONFIG[k]))["state"]
+                      for role, k in ROLE_CFG.items()]
         except Exception:
             return
-        sig = repr(snapshot) + repr(aux)
-        if sig == getattr(self, "_models_sig", ""):
-            return  # ничего не изменилось — не перестраиваем открытое меню
-        self._models_sig = sig
-        all_rows = [r for _, _, rows in snapshot for r in rows]
-        self.models_menu.title = (
-            "Модели: скачиваются…" if any(st["state"] == "loading"
-                                          for *_, st, _ in all_rows) else
-            "Модели" if all(st["state"] == "done"
-                            for *_, st, act in all_rows if act) else
-            "Модели: активная не скачана")
-        if self.models_menu._menu is not None:  # NSMenu появляется после первого add
-            self.models_menu.clear()
-        for role, title, rows in snapshot:
-            role_item = rumps.MenuItem(
-                f"{title}: {CONFIG[ROLE_CFG[role]].split('/')[-1]}")
-            for repo, label, st, is_active in rows:
-                row = rumps.MenuItem(_model_row(label, st, is_active, repo))
-                if is_active:
-                    row.add(rumps.MenuItem("Активная модель"))
-                elif st["state"] == "done":
-                    act = rumps.MenuItem("Сделать активной (перезапуск)",
-                                         callback=self.activate_model)
-                    act._cfg_key, act._repo = ROLE_CFG[role], repo
-                    row.add(act)
-                    rm = rumps.MenuItem("Удалить с диска", callback=self.delete_model)
-                    rm._repo, rm._path = repo, st["path"]
-                    row.add(rm)
-                elif st["state"] in ("none", "partial"):
-                    dl = rumps.MenuItem(
-                        ("Докачать" if st["state"] == "partial" else "Скачать")
-                        + f" (~{_fmt_mb(st['full'])})", callback=self.download_model)
-                    dl._repo = repo
-                    row.add(dl)
-                else:
-                    row.add(rumps.MenuItem("Скачивается…"))
-                if os.path.isdir(st["path"]):
-                    op = rumps.MenuItem("Открыть папку", callback=self.open_model_dir)
-                    op._model_path = st["path"]
-                    row.add(op)
-                role_item.add(row)
-            self.models_menu.add(role_item)
-        self.models_menu.add(None)
-        for label, st in aux:
-            item = rumps.MenuItem(f"✓ {label} · {_fmt_mb(st['mb'])}",
-                                  callback=self.open_model_dir)
-            item._model_path = st["path"]
-            self.models_menu.add(item)
-        from huggingface_hub.constants import HF_HUB_CACHE
-        cache_item = rumps.MenuItem(f"Кэш: {HF_HUB_CACHE.replace(os.path.expanduser('~'), '~')}",
-                                    callback=self.open_model_dir)
-        cache_item._model_path = HF_HUB_CACHE
-        self.models_menu.add(cache_item)
+        if MANUAL_DL or "loading" in states:
+            title = "Модели: скачиваются…"
+        elif all(st == "done" for st in states):
+            title = "Модели…"
+        else:
+            title = "Модели: активная не скачана…"
+        if self.models_menu.title != title:
+            self.models_menu.title = title
+        if modelswindow.is_visible():
+            modelswindow.refresh()
 
-    def activate_model(self, sender):
-        CONFIG[sender._cfg_key] = sender._repo
+    def open_models(self, _):
+        modelswindow.show(self.models_snapshot, self.model_action)
+
+    @staticmethod
+    def _model_row(role, repo, label, st, active, full):
+        """Строка окна «Модели»: отметка, имя, описание, статус и кнопки по состоянию."""
+        name, _, desc = label.partition(" — ")
+        desc = f"{repo} · {desc}" if desc else repo
+        state = st["state"]
+        folder = ("Папка", f"dir:{st['path']}")
+        if state == "done":
+            mark = "●" if active else "✓"
+            status = ("активная · " if active else "скачана · ") + _fmt_mb(st["mb"])
+            buttons = [folder] if active else [
+                ("Выбрать (перезапуск)", f"act:{role}:{repo}"),
+                ("Удалить", f"rm:{repo}", True), folder]
+        elif state == "loading":
+            mark, buttons = "⬇️", []
+            status = "качается: " + dl_text(DL.get(repo) or st)
+        elif state == "partial":
+            mark = "⚠️"
+            status = (f"частично: {_fmt_mb(st['mb'])} из ~{_fmt_mb(full)} — закачка обрывалась"
+                      if full else f"частично: {_fmt_mb(st['mb'])} — закачка обрывалась")
+            buttons = ([("Докачать", f"dl:{repo}")]
+                       + ([] if active else [("Удалить", f"rm:{repo}", True)]) + [folder])
+        else:
+            mark = "○"
+            status = f"не скачана · ~{_fmt_mb(full)}" if full else "не скачана"
+            if active:
+                status += " · активная — скачается при старте"
+            buttons = [("Скачать", f"dl:{repo}")]
+        return {"key": f"{role}:{repo}", "mark": mark, "name": name, "desc": desc,
+                "status": status, "buttons": buttons}
+
+    def models_snapshot(self):
+        """Снимок для окна: роли из каталога, служебные модели и всё прочее в кэше HF."""
+        import glob
+        from huggingface_hub.constants import HF_HUB_CACHE
+        known, total, sections = set(), 0.0, []
+        for role, (title, options) in ROLES.items():
+            active = CONFIG[ROLE_CFG[role]]
+            rows = []
+            if active not in {r for r, _, _ in options}:  # вписана руками в config.json
+                st = _repo_status(active, 0)
+                total += st["mb"]
+                known.add(active)
+                rows.append(self._model_row(role, active,
+                                            f"{active.split('/')[-1]} — не из каталога",
+                                            st, True, 0))
+            for repo, full, label in options:
+                st = _repo_status(repo, full)
+                total += st["mb"]
+                known.add(repo)
+                rows.append(self._model_row(role, repo, label, st, repo == active, full))
+            note = f"активная: {active.split('/')[-1]}"
+            if role == "llm":
+                note += " · " + ("● в памяти" if STATE["llm_loaded"] else "○ не в памяти")
+                note += (f" · выгружается после {CONFIG['llm_idle_min']} мин простоя"
+                         if CONFIG["unload_llm"] else " · держится в памяти постоянно")
+            elif role == "asr":
+                note += f" · язык: {CONFIG['asr_language'] or 'авто'}"
+            sections.append({"title": title, "note": note, "rows": rows})
+        # служебные: отпечаток голоса и детектор речи
+        ec = _repo_status(*ECAPA)
+        total += ec["mb"]
+        known.add(ECAPA[0])
+        aux = [self._model_row("aux", ECAPA[0],
+                               "ECAPA-voxceleb — отпечаток голоса для «Мой голос»",
+                               ec, True, ECAPA[1])]
+        try:  # Silero VAD едет внутри pip-пакета, отдельно не скачивается
+            import silero_vad
+            d = os.path.dirname(silero_vad.__file__)
+            aux.append({"key": "aux:silero", "mark": "✓", "name": "Silero VAD",
+                        "desc": "детектор речи · в составе pip-пакета silero-vad",
+                        "status": "в пакете · " + _fmt_mb(_dir_size_mb(d)),
+                        "buttons": [("Папка", f"dir:{d}")]})
+        except ImportError:
+            pass
+        sections.append({"title": "Служебные", "note": "", "rows": aux})
+        # всё остальное в кэже HF — не из каталога dictate
+        others = []
+        for d in sorted(glob.glob(os.path.join(HF_HUB_CACHE, "models--*"))):
+            repo = os.path.basename(d)[len("models--"):].replace("--", "/")
+            if repo in known:
+                continue
+            st = _repo_status(repo, 0)
+            total += st["mb"]
+            others.append({"key": f"other:{repo}",
+                           "mark": "✓" if st["state"] == "done" else "⚠️",
+                           "name": repo.split("/")[-1],
+                           "desc": f"{repo} · не из каталога dictate — могла скачать "
+                                   "другая программа",
+                           "status": _fmt_mb(st["mb"]),
+                           "buttons": [("Удалить", f"rm:{repo}", True), ("Папка", f"dir:{d}")]})
+        if others:
+            sections.append({"title": "Другие модели в кэше", "note": "", "rows": others})
+        cache = HF_HUB_CACHE.replace(os.path.expanduser("~"), "~")
+        return {"sections": sections,
+                "footer": f"Кэш HuggingFace: {cache} · на диске {_fmt_mb(total)}"}
+
+    def model_action(self, key):
+        """Кнопки окна «Модели»: act:<роль>:<репо> / dl:<репо> / rm:<репо> / dir:<путь> / cache."""
+        kind, _, rest = key.partition(":")
+        if kind == "act":
+            role, _, repo = rest.partition(":")
+            self._model_activate(ROLE_CFG[role], repo)
+        elif kind == "dl":
+            self._model_download(rest)
+        elif kind == "rm":
+            self._model_delete(rest)
+        elif kind == "dir":
+            subprocess.run(["open", rest if os.path.isdir(rest) else os.path.dirname(rest)])
+        elif kind == "cache":
+            subprocess.run(["open", os.path.dirname(_repo_dir("x/y"))])
+
+    def _model_activate(self, cfg_key, repo):
+        CONFIG[cfg_key] = repo
         save_config()
-        print(f"Активная модель теперь {sender._repo} — перезапускаюсь...", flush=True)
+        print(f"Активная модель теперь {repo} — перезапускаюсь...", flush=True)
         restart_app()  # умеет и launchd, и запуск вручную (execv)
 
-    def download_model(self, sender):
-        repo = sender._repo
-        if not hasattr(self, "_downloading"):
-            self._downloading = set()
-        if repo in self._downloading:
+    def _model_download(self, repo):
+        if repo in MANUAL_DL:
             return
-        self._downloading.add(repo)
+        MANUAL_DL.add(repo)
 
         def dl():
             try:
@@ -3428,34 +3483,35 @@ class DictateApp(rumps.App):
             except Exception as e:
                 print(f"  модель {repo} не скачалась: {e}", flush=True)
             finally:
-                self._downloading.discard(repo)
+                MANUAL_DL.discard(repo)
                 _repo_cache.pop(repo, None)
-                self._models_sig = ""
         threading.Thread(target=dl, daemon=True).start()
-        self._models_sig = ""  # прогресс появится при следующем обновлении
+        _repo_cache.pop(repo, None)  # прогресс появится при следующем обновлении
 
-    def delete_model(self, sender):
-        if sender._repo in (CONFIG["asr_model"], CONFIG["llm_model"]):
+    def _model_delete(self, repo):
+        if repo in (CONFIG["asr_model"], CONFIG["llm_model"]):
             rumps.alert("Модели", "Эта модель сейчас активна — сначала выбери другую.")
             return
-        if getattr(self, "_downloading", set()) & {sender._repo}:
+        stage = (STATE.get("stage_repo") or ("",))[0]
+        if repo in MANUAL_DL or (STATE["loading"] and stage == repo):
             rumps.alert("Модели", "Эта модель сейчас скачивается — дождись конца.")
             return
+        path = _repo_dir(repo)
+        size = _fmt_mb(_repo_status(repo, 0)["mb"])
+        if rumps.alert("Удалить модель",
+                       f"{repo} ({size}) будет удалена с диска целиком — папка в кэше "
+                       "HuggingFace и её замки. Скачать заново можно в этом же окне.",
+                       ok="Удалить", cancel="Отмена") != 1:
+            return
         import shutil
-        repo, path = sender._repo, sender._path
+        locks = os.path.join(os.path.dirname(path), ".locks", os.path.basename(path))
 
-        def rm():  # rmtree на 17 ГБ в главном потоке морозит меню на секунды
+        def rm():  # rmtree на 17 ГБ в главном потоке морозит окно на секунды
             shutil.rmtree(path, ignore_errors=True)
-            print(f"Модель {repo} удалена с диска.", flush=True)
+            shutil.rmtree(locks, ignore_errors=True)
+            print(f"Модель {repo} удалена с диска ({size}).", flush=True)
             _repo_cache.pop(repo, None)
-            self._models_sig = ""
         threading.Thread(target=rm, daemon=True).start()
-
-    def open_model_dir(self, sender):
-        path = sender._model_path
-        if not os.path.isdir(path):
-            path = os.path.dirname(path)
-        subprocess.run(["open", path])
 
     def refresh_title(self, _):
         # ❌ — модели не загрузились; ⚠️ — поток мёртв/переоткрывается
