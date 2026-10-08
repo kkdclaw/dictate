@@ -89,7 +89,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.19.1"
+VERSION = "0.19.2"
 REPO_HTTPS = "https://github.com/kkdclaw/dictate.git"  # откуда обновляемся: без ключей
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
@@ -206,7 +206,9 @@ ROLES = {  # роль -> (заголовок раздела, [(HF-репозит
         ("mlx-community/whisper-large-v3-turbo", 1600,
          "Whisper large-v3-turbo — быстрая"),
         ("mlx-community/whisper-large-v3-mlx", 3100,
-         "Whisper large-v3 — точнее, в ~2 раза медленнее"),
+         "Whisper large-v3 — точнее (лучшая по русскому среди локальных), в ~3 раза медленнее"),
+        ("valtu4a/whisper-large-v3-russian-mlx", 3100,
+         "Whisper large-v3 Russian — дообучена на русском; термины латиницей может ломать"),
         ("mlx-community/whisper-large-v3-turbo-q4", 500,
          "Whisper turbo 4-bit — для слабых машин, качество почти turbo"),
     ]),
@@ -217,6 +219,12 @@ ROLES = {  # роль -> (заголовок раздела, [(HF-репозит
          "Qwen3-1.7B — для слабых машин"),
         ("RockTalk/GigaChat3.1-10B-A1.8B-MLX-4bit", 6000,
          "GigaChat 3.1 Lightning (MoE) — русскоцентричная, быстрая"),
+        ("mlx-community/Qwen3.5-4B-MLX-4bit", 3100,
+         "Qwen3.5-4B — новое поколение; в текущем mlx-lm медленная (~21 т/с)"),
+        ("mlx-community/Qwen3.5-9B-MLX-4bit", 6000,
+         "Qwen3.5-9B — качественнее; в текущем mlx-lm медленная"),
+        ("mlx-community/gemma-4-e4b-it-4bit", 5200,
+         "Gemma 4 E4B — проба: сильна в языках, русских замеров нет"),
     ]),
 }
 ROLE_CFG = {"asr": "asr_model", "llm": "llm_model"}  # роль -> ключ в config.json
@@ -1579,6 +1587,17 @@ FORMAL_PROMPT_ADDON = (
 )
 
 
+def chat_prompt(tok, msgs):
+    """Промпт по шаблону модели с выключенным «думанием» (Qwen3.5, Gemma 4):
+    чистке нужен только ответ, иначе в текст уезжает <think>…</think>. Модели
+    без такого режима лишний аргумент шаблона игнорируют."""
+    try:
+        return tok.apply_chat_template(msgs, add_generation_prompt=True,
+                                       enable_thinking=False)
+    except TypeError:
+        return tok.apply_chat_template(msgs, add_generation_prompt=True)
+
+
 def fix_model_config(repo: str) -> list:
     """Привести к float поля конфига модели, которые transformers объявляет
     float, а автор модели записал целым. Возвращает список починенных полей.
@@ -1674,9 +1693,8 @@ def ml_worker(ready: threading.Event):
             if warm_stage:
                 load_stage(5, "прогрев")
             try:
-                for _ in stream_generate(llm, tok, prompt=tok.apply_chat_template(
-                        [{"role": "user", "content": "ок"}], add_generation_prompt=True),
-                        max_tokens=4):
+                for _ in stream_generate(llm, tok, prompt=chat_prompt(
+                        tok, [{"role": "user", "content": "ок"}]), max_tokens=4):
                     pass  # прогрев, чтобы первая чистка была быстрой
             except Exception:
                 # Metal OOM на 16 ГБ: веса уже в L, и без этого они висели бы в
@@ -1906,7 +1924,7 @@ def ml_worker(ready: threading.Event):
         L["worked"] = True      # прогрев — не работа: см. llm_idle
         pcache = L              # KV-кэш префикса лежит рядом с моделью
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        prompt = tok.apply_chat_template(msgs, add_generation_prompt=True)
+        prompt = chat_prompt(tok, msgs)
         cache, cached = pcache["cache"], pcache["tokens"]
         # общий префикс с тем, что уже лежит в KV-кэше (константные правила+словарь)
         common = 0
