@@ -89,7 +89,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.21.0"
+VERSION = "0.22.0"
 REPO_HTTPS = "https://github.com/kkdclaw/dictate.git"  # откуда обновляемся: без ключей
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"

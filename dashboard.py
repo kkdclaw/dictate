@@ -100,13 +100,26 @@ def compute(rs):
     }
 
 
+def audio_ids() -> set:
+    """id строк истории, у которых лежит audio/<id>.wav (галка «Хранить аудио
+    диктовок»): по ним в «Поиске истории» у строки рисуется кнопка ▶."""
+    try:
+        names = os.listdir(os.path.join(BASE, "audio"))
+    except FileNotFoundError:
+        return set()
+    return {int(n[:-4]) for n in names if n.endswith(".wav") and n[:-4].isdigit()}
+
+
 def search_data(rs):
+    have = audio_ids()
     return [{
+        "id": r["id"],
         "t": datetime.fromtimestamp(r["ts"]).strftime("%d.%m %H:%M"),
         "app": r["app"] or "?",
         "text": r["text"] or "",
         "raw": (r["raw_text"] or "") if (r["raw_text"] or "") != (r["text"] or "") else "",
         "asr": _asr_label(r),
+        "audio": r["id"] in have,
     } for r in rs]
 
 
@@ -394,6 +407,12 @@ main{max-width:1320px;margin:0 auto;padding:22px 28px 60px}
 .row-h .app{color:var(--series);font-weight:600}
 .row-t{white-space:pre-wrap}
 .row-raw{color:var(--muted);font-size:12.5px;margin-top:5px}
+.au{margin-left:auto;display:flex;gap:8px;align-items:center}
+.pt{font-variant-numeric:tabular-nums}
+.play{border:1px solid var(--border);background:var(--surface);color:var(--series);
+  border-radius:50%;width:24px;height:24px;padding:0;font-size:11px;line-height:1;cursor:pointer;flex:none}
+.play:hover{border-color:var(--series)}
+.play.on{background:var(--series);border-color:var(--series);color:#fff}
 mark{background:rgba(235,104,52,.28);color:inherit;border-radius:2px;padding:0 1px}
 @media(max-width:820px){.tiles{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
 </style></head><body>
@@ -425,10 +444,33 @@ function render(q){
   document.getElementById('count').textContent=r.length+' из '+DATA.length;
   document.getElementById('results').innerHTML=r.slice(0,400).map(d=>
     '<div class="row"><div class="row-h"><span class="app">'+esc(d.app)+
-    '</span><span>'+esc(d.t)+'</span>'+(d.asr?'<span>'+esc(d.asr)+'</span>':'')+'</div><div class="row-t">'+hl(d.text,q)+'</div>'+
+    '</span><span>'+esc(d.t)+'</span>'+(d.asr?'<span>'+esc(d.asr)+'</span>':'')+
+    (d.audio?'<span class="au"><span class="pt" data-id="'+d.id+'"></span>'+
+      '<button class="play" data-id="'+d.id+'" title="Прослушать запись">▶</button></span>':'')+
+    '</div><div class="row-t">'+hl(d.text,q)+'</div>'+
     (d.raw?'<div class="row-raw">сырой: '+hl(d.raw,q)+'</div>':'')+'</div>').join('')||
     '<p class="empty">ничего не найдено</p>';
+  syncPlay();
 }
+// ▶ у строк с сохранённой записью (audio/<id>.wav): один проигрыватель на страницу,
+// повторный клик — пауза, клик по другой строке — переключение
+const player=new Audio();let playing=null;
+function fmt(s){s=Math.floor(s||0);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
+function syncPlay(){
+  document.querySelectorAll('.play').forEach(b=>{const on=b.dataset.id===playing&&!player.paused;
+    b.textContent=on?'❚❚':'▶';b.classList.toggle('on',on)});
+  document.querySelectorAll('.pt').forEach(p=>{p.textContent=p.dataset.id===playing&&player.duration?
+    fmt(player.currentTime)+' / '+fmt(player.duration):''});
+}
+document.getElementById('results').addEventListener('click',e=>{
+  const b=e.target.closest('.play');if(!b)return;
+  const id=b.dataset.id;
+  if(id===playing){player.paused?player.play():player.pause();return}
+  playing=id;player.src='audio/'+id+'.wav';player.play();
+});
+['play','pause','ended','timeupdate','loadedmetadata'].forEach(ev=>player.addEventListener(ev,syncPlay));
+player.addEventListener('error',()=>{const b=document.querySelector('.play[data-id="'+playing+'"]');
+  if(b){b.textContent='✕';b.title='запись не читается';b.classList.remove('on')}});
 function show(v){
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t.dataset.v===v));
   document.querySelectorAll('.view').forEach(s=>s.classList.toggle('on',s.id===v));
