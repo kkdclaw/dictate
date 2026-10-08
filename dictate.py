@@ -89,7 +89,7 @@ sys.stderr = _StampedOut(sys.stderr)
 #   MINOR — новые возможности
 #   PATCH — исправления без новых возможностей
 # Тег ставится на релизном коммите: git tag -a v0.4.0 -m "…" && git push --tags
-VERSION = "0.19.0"
+VERSION = "0.19.1"
 REPO_HTTPS = "https://github.com/kkdclaw/dictate.git"  # откуда обновляемся: без ключей
 ASR_MODEL = "mlx-community/whisper-large-v3-turbo"
 LLM_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
@@ -207,12 +207,8 @@ ROLES = {  # роль -> (заголовок раздела, [(HF-репозит
          "Whisper large-v3-turbo — быстрая"),
         ("mlx-community/whisper-large-v3-mlx", 3100,
          "Whisper large-v3 — точнее, в ~2 раза медленнее"),
-        ("mlx-community/whisper-medium-mlx", 1500,
-         "Whisper medium — лёгкая, качество ниже"),
         ("mlx-community/whisper-large-v3-turbo-q4", 500,
          "Whisper turbo 4-bit — для слабых машин, качество почти turbo"),
-        ("mlx-community/whisper-small-mlx", 500,
-         "Whisper small — совсем лёгкая, русский заметно хуже"),
     ]),
     "llm": ("Чистка текста", [
         ("mlx-community/Qwen3-4B-Instruct-2507-4bit", 2300,
@@ -221,10 +217,6 @@ ROLES = {  # роль -> (заголовок раздела, [(HF-репозит
          "Qwen3-1.7B — для слабых машин"),
         ("RockTalk/GigaChat3.1-10B-A1.8B-MLX-4bit", 6000,
          "GigaChat 3.1 Lightning (MoE) — русскоцентричная, быстрая"),
-        ("mlx-community/Qwen3-14B-4bit", 8300,
-         "Qwen3-14B — качественнее, медленнее"),
-        ("mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit", 17200,
-         "Qwen3-30B-A3B (MoE) — лучшее качество"),
     ]),
 }
 ROLE_CFG = {"asr": "asr_model", "llm": "llm_model"}  # роль -> ключ в config.json
